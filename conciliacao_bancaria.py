@@ -1,6 +1,6 @@
 """
 Dashboard de Conciliação Bancária
-OFX (Extrato Bancário) x XLSX (Extrato Rede)
+OFX (Extrato Bancário) x XLS (Intermediadora / Rede)
 """
 
 import streamlit as st
@@ -64,168 +64,127 @@ def parse_ofx(file_bytes: bytes) -> pd.DataFrame:
 def detectar_bandeira_tipo(memo: str):
     """Extrai bandeira e tipo (CREDITO/DEBITO) do memo do OFX."""
     memo_upper = memo.upper()
-
     bandeiras = ["VISA", "MASTERCARD", "MASTER", "ELO", "AMEX",
                  "AMERICAN EXPRESS", "HIPERCARD", "HIPER", "CABAL", "DINERS"]
     tipos = ["CREDITO", "CRÉDITO", "DEBITO", "DÉBITO", "CREDIT", "DEBIT"]
 
     bandeira, tipo = "OUTROS", "OUTROS"
-
     for b in bandeiras:
         if b in memo_upper:
             bandeira = "MASTERCARD" if b == "MASTER" else b
-            bandeira = "AMEX" if b == "AMERICAN EXPRESS" else bandeira
-            bandeira = "HIPERCARD" if b == "HIPER" else bandeira
+            bandeira = "AMEX"       if b == "AMERICAN EXPRESS" else bandeira
+            bandeira = "HIPERCARD"  if b == "HIPER" else bandeira
             break
-
     for t in tipos:
         if t in memo_upper:
             tipo = "CREDITO" if t in ["CREDITO", "CRÉDITO", "CREDIT"] else "DEBITO"
             break
-
     return bandeira, tipo
 
 
 def parse_intermediadora_xls(file) -> pd.DataFrame:
-    """
-    Parser específico para o relatório TSV da intermediadora (extensão .xls).
-    Colunas mapeadas:
-      DATA VENDA, BANDEIRA, TRANSAÇÃO, VALOR BRUTO, VALOR LÍQUIDO,
-      TAXA FINAL (R$), TAXA FINAL (%), STATUS VENDA, C.V., ESTABELECIMENTO
-    """
+    """Parser para o relatório TSV da intermediadora (.xls)."""
     def to_float(s):
         if pd.isna(s) or str(s).strip() in ("", "-", "nan"): return 0.0
-        s = str(s).strip()
-        # Remove conteúdo entre parênteses: "(1.26%)" etc.
-        s = re.sub(r"\(.*?\)", "", s)
-        # Extrai apenas sequências numéricas com vírgula/ponto
+        s = re.sub(r"\(.*?\)", "", str(s).strip())
         nums = re.findall(r"[\d.,]+", s)
         if not nums: return 0.0
-        n = nums[0].replace(".", "").replace(",", ".")
-        try: return float(n)
+        try: return float(nums[0].replace(".", "").replace(",", "."))
         except: return 0.0
 
-    # Arquivo é TSV com encoding latin-1
     try:
         content = file.read()
-        if isinstance(content, bytes):
-            text = content.decode("latin-1", errors="ignore")
-        else:
-            text = content
-        df_raw = pd.read_csv(
-            io.StringIO(text),
-            sep="\t",
-            dtype=str,
-            encoding=None,
-        )
+        text = content.decode("latin-1", errors="ignore") if isinstance(content, bytes) else content
+        df_raw = pd.read_csv(io.StringIO(text), sep="\t", dtype=str, encoding=None)
     except Exception as e:
         raise ValueError(f"Erro ao ler arquivo da intermediadora: {e}")
 
     df_raw.columns = [c.strip() for c in df_raw.columns]
 
-    # Mapeamento direto das colunas conhecidas
     df = pd.DataFrame()
     df["data"]          = pd.to_datetime(df_raw["DATA VENDA"], dayfirst=True, errors="coerce").dt.date
     df["bandeira"]      = df_raw["BANDEIRA"].astype(str).str.strip().str.upper()
-    df["tipo"]          = df_raw["TRANSAÇÃO"].astype(str).str.strip()
+    df["tipo"]          = df_raw["TRANSACAO"].astype(str).str.strip() if "TRANSACAO" in df_raw.columns else df_raw["TRANSAÇÃO"].astype(str).str.strip()
     df["valor_bruto"]   = df_raw["VALOR BRUTO"].apply(to_float)
-    df["valor_liquido"] = df_raw["VALOR LÍQUIDO"].apply(to_float)
+    df["valor_liquido"] = df_raw["VALOR LÍQUIDO"].apply(to_float) if "VALOR LÍQUIDO" in df_raw.columns else df_raw["VALOR LIQUIDO"].apply(to_float)
     df["taxa_final"]    = df_raw["TAXA FINAL (R$)"].apply(to_float)
     df["taxa_pct"]      = df_raw["TAXA FINAL (%)"].apply(to_float)
-    df["status"]        = df_raw.get("STATUS VENDA", pd.Series([""] * len(df_raw))).astype(str)
+    df["status_adq"]    = df_raw.get("STATUS VENDA", pd.Series([""] * len(df_raw))).astype(str)
     df["cv"]            = df_raw.get("C.V.", pd.Series([""] * len(df_raw))).astype(str)
     df["estabelecimento"] = df_raw.get("ESTABELECIMENTO", pd.Series([""] * len(df_raw))).astype(str)
 
-    # Normaliza bandeira
     df["bandeira"] = df["bandeira"].replace({
-        "MASTER":           "MASTERCARD",
-        "MC":               "MASTERCARD",
-        "AMERICAN EXPRESS": "AMEX",
-        "AX":               "AMEX",
-        "VI":               "VISA",
+        "MASTER": "MASTERCARD", "MC": "MASTERCARD",
+        "AMERICAN EXPRESS": "AMEX", "AX": "AMEX", "VI": "VISA",
     })
-
-    # Normaliza tipo → CREDITO / DEBITO
     df["tipo_norm"] = df["tipo"].apply(
         lambda x: "CREDITO" if "CRÉD" in x.upper() or "CRED" in x.upper()
                   else ("DEBITO" if "DÉB" in x.upper() or "DEB" in x.upper() else x.upper())
     )
 
-    # Remove linhas sem data
     df = df.dropna(subset=["data"])
-    df = df[df["valor_bruto"] > 0]
-
+    df = df[df["valor_bruto"] > 0].reset_index(drop=True)
+    df["idx_transacao"] = df.index
     return df
 
 
 def agrupar_rede(df_rede: pd.DataFrame) -> pd.DataFrame:
-    """Agrupa transações por data + bandeira + tipo, somando valores e contando transações."""
-    group_cols = [c for c in ["data", "bandeira", "tipo_norm"] if c in df_rede.columns]
+    """Agrupa por data + bandeira + tipo, preservando lista de índices por grupo."""
+    group_cols = ["data", "bandeira", "tipo_norm"]
     agg = {}
-    if "valor_bruto"   in df_rede.columns: agg["valor_bruto"]   = "sum"
-    if "valor_liquido" in df_rede.columns: agg["valor_liquido"] = "sum"
-    if "taxa_final"    in df_rede.columns: agg["taxa_final"]    = "sum"
-    agg["cv"] = "count"
+    for c in ["valor_bruto", "valor_liquido", "taxa_final"]:
+        if c in df_rede.columns: agg[c] = "sum"
+    agg["idx_transacao"] = lambda x: list(x)
 
     df_group = df_rede.groupby(group_cols, as_index=False).agg(agg)
-    df_group = df_group.rename(columns={"cv": "qtd_transacoes"})
+    df_group["qtd_transacoes"] = df_group["idx_transacao"].apply(len)
+    df_group = df_group.reset_index(drop=True)
+    df_group["idx_grupo"] = df_group.index
     return df_group
 
 
 def conciliar(df_ofx: pd.DataFrame, df_rede_grupo: pd.DataFrame,
               tolerancia_dias: int = 1, tolerancia_valor: float = 0.05) -> pd.DataFrame:
-    """Cruza OFX com Rede agrupado por data + bandeira + tipo + valor líquido."""
+    """Cruza OFX com grupos da intermediadora. Mantém idx_grupo para rastreio."""
     df_ofx = df_ofx.copy()
     bandeira_tipo = df_ofx["memo"].apply(lambda m: pd.Series(detectar_bandeira_tipo(m)))
     df_ofx[["bandeira_ofx", "tipo_ofx"]] = bandeira_tipo
 
-    resultados = []
+    resultados  = []
     rede_usados = set()
-    rede_rows = df_rede_grupo.reset_index(drop=True)
+    rede_rows   = df_rede_grupo.reset_index(drop=True)
 
-    for i_ofx, row_ofx in df_ofx.iterrows():
+    for _, row_ofx in df_ofx.iterrows():
         melhor_match = None
         melhor_diff  = float("inf")
 
         for i_rede, row_rede in rede_rows.iterrows():
-            if i_rede in rede_usados:
-                continue
-
-            # Filtro bandeira
+            if i_rede in rede_usados: continue
             if (row_ofx["bandeira_ofx"] not in ("OUTROS", "") and
                     row_rede.get("bandeira", "") not in ("OUTROS", "") and
-                    row_ofx["bandeira_ofx"] != row_rede.get("bandeira", "")):
-                continue
-
-            # Filtro tipo
+                    row_ofx["bandeira_ofx"] != row_rede.get("bandeira", "")): continue
             if (row_ofx["tipo_ofx"] not in ("OUTROS", "") and
                     row_rede.get("tipo_norm", "") not in ("OUTROS", "") and
-                    row_ofx["tipo_ofx"] != row_rede.get("tipo_norm", "")):
-                continue
-
-            # Filtro data
+                    row_ofx["tipo_ofx"] != row_rede.get("tipo_norm", "")): continue
             diff_dias = abs((row_ofx["data"] - row_rede["data"]).days)
-            if diff_dias > tolerancia_dias:
-                continue
-
-            # Filtro valor
+            if diff_dias > tolerancia_dias: continue
             val_ofx  = abs(row_ofx["valor_ofx"])
             val_rede = abs(row_rede.get("valor_liquido", row_rede.get("valor_bruto", 0)))
-            if val_rede == 0:
-                continue
+            if val_rede == 0: continue
             diff_perc = abs(val_ofx - val_rede) / val_rede
-            if diff_perc > tolerancia_valor:
-                continue
-
+            if diff_perc > tolerancia_valor: continue
             score = diff_dias + diff_perc
             if score < melhor_diff:
                 melhor_diff  = score
                 melhor_match = i_rede
 
-        row_rede_matched = {}
+        row_rede_matched  = {}
+        idx_grupo_matched = None
+
         if melhor_match is not None:
             rede_usados.add(melhor_match)
-            row_rede_matched = rede_rows.loc[melhor_match].to_dict()
+            row_rede_matched  = rede_rows.loc[melhor_match].to_dict()
+            idx_grupo_matched = row_rede_matched.get("idx_grupo")
             diff_valor = abs(row_ofx["valor_ofx"]) - abs(row_rede_matched.get("valor_liquido", 0))
             status = "⚠️ Conciliado c/ Divergência" if abs(diff_valor) > 0.01 else "✅ Conciliado"
         else:
@@ -233,62 +192,133 @@ def conciliar(df_ofx: pd.DataFrame, df_rede_grupo: pd.DataFrame,
             diff_valor = None
 
         resultados.append({
-            "Status":             status,
-            "Data OFX":           row_ofx["data"],
-            "Valor OFX":          row_ofx["valor_ofx"],
-            "Memo OFX":           row_ofx["memo"],
-            "Bandeira OFX":       row_ofx["bandeira_ofx"],
-            "Tipo OFX":           row_ofx["tipo_ofx"],
-            "Data Rede":          row_rede_matched.get("data", ""),
-            "Bandeira Rede":      row_rede_matched.get("bandeira", ""),
-            "Tipo Rede":          row_rede_matched.get("tipo_norm", ""),
-            "Valor Bruto Rede":   row_rede_matched.get("valor_bruto", ""),
-            "Valor Líq. Rede":    row_rede_matched.get("valor_liquido", ""),
-            "Qtd Transações":     row_rede_matched.get("qtd_transacoes", ""),
-            "Diferença (R$)":     diff_valor,
+            "Status":           status,
+            "idx_grupo":        idx_grupo_matched,
+            "Data OFX":         row_ofx["data"],
+            "Valor OFX":        row_ofx["valor_ofx"],
+            "Memo OFX":         row_ofx["memo"],
+            "Bandeira OFX":     row_ofx["bandeira_ofx"],
+            "Tipo OFX":         row_ofx["tipo_ofx"],
+            "Data Rede":        row_rede_matched.get("data", ""),
+            "Bandeira Rede":    row_rede_matched.get("bandeira", ""),
+            "Tipo Rede":        row_rede_matched.get("tipo_norm", ""),
+            "Valor Bruto Rede": row_rede_matched.get("valor_bruto", ""),
+            "Valor Líq. Rede":  row_rede_matched.get("valor_liquido", ""),
+            "Qtd Transações":   row_rede_matched.get("qtd_transacoes", ""),
+            "Diferença (R$)":   diff_valor,
         })
 
-    # Não conciliados da Rede
     for i_rede, row_rede in rede_rows.iterrows():
         if i_rede not in rede_usados:
             resultados.append({
-                "Status":             "❌ Não Conciliado (Rede)",
-                "Data OFX":           "", "Valor OFX": "", "Memo OFX": "",
-                "Bandeira OFX":       "", "Tipo OFX": "",
-                "Data Rede":          row_rede.get("data", ""),
-                "Bandeira Rede":      row_rede.get("bandeira", ""),
-                "Tipo Rede":          row_rede.get("tipo_norm", ""),
-                "Valor Bruto Rede":   row_rede.get("valor_bruto", ""),
-                "Valor Líq. Rede":    row_rede.get("valor_liquido", ""),
-                "Qtd Transações":     row_rede.get("qtd_transacoes", ""),
-                "Diferença (R$)":     None,
+                "Status":           "❌ Não Conciliado (Rede)",
+                "idx_grupo":        row_rede.get("idx_grupo"),
+                "Data OFX":         "", "Valor OFX": "", "Memo OFX": "",
+                "Bandeira OFX":     "", "Tipo OFX": "",
+                "Data Rede":        row_rede.get("data", ""),
+                "Bandeira Rede":    row_rede.get("bandeira", ""),
+                "Tipo Rede":        row_rede.get("tipo_norm", ""),
+                "Valor Bruto Rede": row_rede.get("valor_bruto", ""),
+                "Valor Líq. Rede":  row_rede.get("valor_liquido", ""),
+                "Qtd Transações":   row_rede.get("qtd_transacoes", ""),
+                "Diferença (R$)":   None,
             })
 
     return pd.DataFrame(resultados)
 
 
-def exportar_excel(df_result: pd.DataFrame, df_rede_orig: pd.DataFrame,
-                   df_rede_grupo: pd.DataFrame) -> bytes:
-    output = io.BytesIO()
-    with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
-        df_result.to_excel(writer,    sheet_name="Conciliação",    index=False)
-        df_rede_grupo.to_excel(writer, sheet_name="Rede - Agrupado", index=False)
-        df_rede_orig.to_excel(writer,  sheet_name="Rede - Detalhe",  index=False)
+def build_status_transacao(df_rede_orig: pd.DataFrame,
+                            df_rede_grupo: pd.DataFrame,
+                            df_result: pd.DataFrame,
+                            vinculos_manuais: dict) -> pd.DataFrame:
+    """Propaga status do grupo (conciliação auto + manual) para cada transação individual."""
+    # Mapa idx_grupo → status (automático)
+    status_grupo = {}
+    memo_grupo   = {}
+    valor_grupo  = {}
+    for _, row in df_result.iterrows():
+        ig = row["idx_grupo"]
+        if ig is not None:
+            status_grupo[ig] = row["Status"]
+            memo_grupo[ig]   = row.get("Memo OFX", "")
+            valor_grupo[ig]  = row.get("Valor OFX", "")
 
-        wb = writer.book
+    # Sobrescreve com vínculos manuais
+    for ig, info in vinculos_manuais.items():
+        status_grupo[ig] = info["status"]
+        memo_grupo[ig]   = info.get("memo_ofx", "")
+        valor_grupo[ig]  = info.get("valor_ofx", "")
+
+    # Mapa idx_transacao → idx_grupo
+    mapa_idx = {}
+    for _, row in df_rede_grupo.iterrows():
+        for idx_t in row["idx_transacao"]:
+            mapa_idx[idx_t] = row["idx_grupo"]
+
+    df = df_rede_orig.copy()
+    df["idx_grupo"]          = df["idx_transacao"].map(mapa_idx)
+    df["Status Conciliação"] = df["idx_grupo"].map(
+        lambda ig: status_grupo.get(ig, "❌ Não Conciliado (Rede)")
+    )
+    df["Memo OFX Vinculado"]  = df["idx_grupo"].map(lambda ig: memo_grupo.get(ig, ""))
+    df["Valor OFX Vinculado"] = df["idx_grupo"].map(lambda ig: valor_grupo.get(ig, ""))
+
+    return df
+
+
+def exportar_excel(df_result: pd.DataFrame,
+                   df_detalhe_status: pd.DataFrame,
+                   df_rede_grupo: pd.DataFrame,
+                   vinculos_manuais: dict) -> bytes:
+    output = io.BytesIO()
+
+    df_result_exp = df_result.drop(columns=["idx_grupo"], errors="ignore")
+    df_grupo_exp  = df_rede_grupo.drop(columns=["idx_transacao", "idx_grupo"], errors="ignore")
+    cols_det      = [c for c in df_detalhe_status.columns if c not in ("idx_transacao", "idx_grupo")]
+    df_det_exp    = df_detalhe_status[cols_det]
+
+    # Aba de vínculos manuais
+    registros_manual = []
+    for ig, info in vinculos_manuais.items():
+        registros_manual.append({
+            "Status":          info["status"],
+            "Memo OFX":        info.get("memo_ofx", ""),
+            "Valor OFX":       info.get("valor_ofx", ""),
+            "Data OFX":        str(info.get("data_ofx", "")),
+            "Diferença (R$)":  info.get("diff_valor", ""),
+            "Observação":      info.get("observacao", ""),
+        })
+    df_manual = pd.DataFrame(registros_manual) if registros_manual else pd.DataFrame()
+
+    with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
+        df_result_exp.to_excel(writer, sheet_name="Conciliação",        index=False)
+        df_grupo_exp.to_excel(writer,  sheet_name="Grupos",             index=False)
+        df_det_exp.to_excel(writer,    sheet_name="Detalhe Transações", index=False)
+        if not df_manual.empty:
+            df_manual.to_excel(writer, sheet_name="Vínculos Manuais",   index=False)
+
+        wb    = writer.book
         fmt_h    = wb.add_format({"bold": True, "bg_color": "#1F3864", "font_color": "white", "border": 1})
         fmt_ok   = wb.add_format({"bg_color": "#C6EFCE"})
         fmt_warn = wb.add_format({"bg_color": "#FFEB9C"})
+        fmt_man  = wb.add_format({"bg_color": "#DDEBF7"})
         fmt_err  = wb.add_format({"bg_color": "#FFC7CE"})
 
-        ws = writer.sheets["Conciliação"]
-        for col_num, col_name in enumerate(df_result.columns):
-            ws.write(0, col_num, col_name, fmt_h)
-            ws.set_column(col_num, col_num, 22)
-        for row_num in range(1, len(df_result) + 1):
-            status = str(df_result.iloc[row_num - 1]["Status"])
-            fmt = fmt_ok if "✅" in status else (fmt_warn if "⚠️" in status else fmt_err)
-            ws.set_row(row_num, None, fmt)
+        def aplicar_formato(ws, df_exp, status_col):
+            for col_num, col_name in enumerate(df_exp.columns):
+                ws.write(0, col_num, col_name, fmt_h)
+                ws.set_column(col_num, col_num, 22)
+            if status_col in df_exp.columns:
+                for row_num in range(1, len(df_exp) + 1):
+                    s = str(df_exp.iloc[row_num - 1][status_col])
+                    if "✅" in s:    fmt = fmt_ok
+                    elif "⚠️" in s: fmt = fmt_warn
+                    elif "🔗" in s: fmt = fmt_man
+                    else:            fmt = fmt_err
+                    ws.set_row(row_num, None, fmt)
+
+        aplicar_formato(writer.sheets["Conciliação"],        df_result_exp, "Status")
+        aplicar_formato(writer.sheets["Detalhe Transações"], df_det_exp,    "Status Conciliação")
 
     return output.getvalue()
 
@@ -298,7 +328,7 @@ def exportar_excel(df_result: pd.DataFrame, df_rede_orig: pd.DataFrame,
 # ─────────────────────────────────────────────
 with st.sidebar:
     st.header("📂 Importar Arquivos")
-    file_ofx  = st.file_uploader("Extrato Bancário (.ofx)", type=["ofx", "OFX"])
+    file_ofx  = st.file_uploader("Extrato Bancário (.ofx)",       type=["ofx", "OFX"])
     file_rede = st.file_uploader("Extrato Intermediadora (.xls)", type=["xls", "xlsx", "tsv", "txt"])
 
     st.divider()
@@ -309,30 +339,39 @@ with st.sidebar:
 
     st.divider()
     st.markdown("**Legenda:**")
-    st.markdown("✅ Conciliado | ⚠️ Divergência | ❌ Não Conciliado")
+    st.markdown("✅ Conciliado automaticamente")
+    st.markdown("⚠️ Conciliado c/ divergência")
+    st.markdown("🔗 Vinculado manualmente")
+    st.markdown("❌ Não conciliado")
+
+# ─────────────────────────────────────────────
+# ESTADO DA SESSÃO
+# ─────────────────────────────────────────────
+if "vinculos_manuais" not in st.session_state:
+    st.session_state["vinculos_manuais"] = {}
+
+# ─────────────────────────────────────────────
+# AGUARDA ARQUIVOS
+# ─────────────────────────────────────────────
+if not file_ofx or not file_rede:
+    st.info("👈 Importe o arquivo OFX e o extrato da intermediadora para iniciar.")
+    with st.expander("ℹ️ Como usar"):
+        st.markdown("""
+**Arquivo OFX** — Extrato bancário exportado pelo banco.  
+Lançamentos com "REDE" no memo são usados na conciliação. "SALDO TOTAL" é ignorado.
+
+**Arquivo XLS** — Relatório da intermediadora (TSV com extensão .xls).
+
+**Conciliação automática:** agrupa por Data + Bandeira + Tipo e cruza com o OFX.
+
+**Vinculação manual:** para grupos não conciliados automaticamente, associe a um  
+lançamento OFX pendente. Vínculos são exportados no Excel.
+        """)
+    st.stop()
 
 # ─────────────────────────────────────────────
 # PROCESSAMENTO
 # ─────────────────────────────────────────────
-if not file_ofx or not file_rede:
-    st.info("👈 Importe o arquivo OFX e o extrato da Rede para iniciar.")
-    with st.expander("ℹ️ Como usar"):
-        st.markdown("""
-**Arquivo OFX** — Extrato bancário exportado pelo seu banco.  
-Contém créditos agrupados por bandeira e tipo (ex: `REDE VISA CREDITO`).
-
-**Arquivo XLS** — Relatório da intermediadora (formato TSV com extensão .xls).  
-Colunas utilizadas: `DATA VENDA`, `BANDEIRA`, `TRANSAÇÃO`, `VALOR BRUTO`, `VALOR LÍQUIDO`, `TAXA FINAL (R$)`.
-
-**Lógica de conciliação:**
-- Transações da intermediadora são **agrupadas** por Data + Bandeira + Tipo e somadas
-- O total líquido é comparado com cada lançamento do OFX
-- Tolerâncias de data e valor são configuráveis na barra lateral
-
-**Dica:** Use *Tolerância de valor 5%* para absorver pequenas diferenças de taxa.
-        """)
-    st.stop()
-
 with st.spinner("Processando arquivos..."):
     try:
         df_ofx_raw = parse_ofx(file_ofx.read())
@@ -348,11 +387,8 @@ with st.spinner("Processando arquivos..."):
     except Exception as e:
         st.error(f"Erro ao ler arquivo da intermediadora: {e}"); st.stop()
 
-# ── Filtros OFX ──────────────────────────────
-# 1. Remove registros de saldo (SALDO TOTAL)
-df_ofx = df_ofx_raw[~df_ofx_raw["memo"].str.upper().str.contains("SALDO TOTAL", na=False)].copy()
-
-# 2. Separa lancamentos REDE (usados na conciliacao) dos demais
+# Filtros OFX
+df_ofx        = df_ofx_raw[~df_ofx_raw["memo"].str.upper().str.contains("SALDO TOTAL", na=False)].copy()
 df_ofx_rede   = df_ofx[df_ofx["memo"].str.upper().str.contains("REDE", na=False)].copy()
 df_ofx_outros = df_ofx[~df_ofx["memo"].str.upper().str.contains("REDE", na=False)].copy()
 
@@ -360,37 +396,41 @@ if col_valor_rede == "Valor Bruto" and "valor_bruto" in df_rede_orig.columns:
     df_rede_orig["valor_liquido"] = df_rede_orig["valor_bruto"]
 
 df_rede_grupo = agrupar_rede(df_rede_orig)
-# Conciliacao usa apenas os lancamentos OFX com "REDE" no memo
 df_result     = conciliar(df_ofx_rede, df_rede_grupo, tolerancia_dias, tolerancia_valor)
+
+# Lançamentos OFX REDE pendentes (não conciliados automaticamente)
+memos_conciliados = set(
+    df_result[df_result["Status"].str.startswith(("✅", "⚠️"))]["Memo OFX"]
+)
+df_ofx_pendentes = df_ofx_rede[~df_ofx_rede["memo"].isin(memos_conciliados)].copy()
+
+# Grupos não conciliados automaticamente
+grupos_nao_conc = df_result[df_result["Status"].str.contains("❌")].copy()
+grupos_vinculados_manual = set(st.session_state["vinculos_manuais"].keys())
 
 # ─────────────────────────────────────────────
 # KPIs
 # ─────────────────────────────────────────────
-total       = len(df_result)
-conciliados = df_result["Status"].str.contains("✅").sum()
-divergentes = df_result["Status"].str.contains("⚠️").sum()
-nao_conc    = df_result["Status"].str.contains("❌").sum()
-pct = lambda n: f"{n/total*100:.1f}%" if total else "0%"
+total_grupos    = len(df_rede_grupo)
+total_conc_auto = df_result["Status"].str.contains("✅|⚠️", regex=True).sum()
+total_manual    = len(grupos_vinculados_manual)
+total_pendentes = max(len(grupos_nao_conc) - total_manual, 0)
+pct = lambda n: f"{n/total_grupos*100:.1f}%" if total_grupos else "0%"
 
 c1, c2, c3, c4 = st.columns(4)
-c1.metric("📋 Total Lançamentos",  total)
-c2.metric("✅ Conciliados",        f"{conciliados} ({pct(conciliados)})")
-c3.metric("⚠️ Com Divergência",    f"{divergentes} ({pct(divergentes)})")
-c4.metric("❌ Não Conciliados",    f"{nao_conc} ({pct(nao_conc)})")
+c1.metric("📋 Grupos Intermediadora",  total_grupos)
+c2.metric("✅ Conciliados auto",        f"{total_conc_auto} ({pct(total_conc_auto)})")
+c3.metric("🔗 Vinculados manualmente", f"{total_manual} ({pct(total_manual)})")
+c4.metric("❌ Pendentes",              f"{total_pendentes} ({pct(total_pendentes)})")
 
-# Valores para KPIs
-# OFX: apenas lancamentos REDE (positivos) — os mesmos usados na conciliacao
-val_ofx_rede   = df_ofx_rede["valor_ofx"].apply(lambda v: v if v > 0 else 0).sum()
-val_ofx_outros = df_ofx_outros["valor_ofx"].apply(lambda v: v if v > 0 else 0).sum()
-val_rede_bruto  = df_rede_orig["valor_bruto"].sum()  if "valor_bruto"   in df_rede_orig.columns else 0
-val_rede_liq    = df_rede_orig["valor_liquido"].sum() if "valor_liquido" in df_rede_orig.columns else 0
-val_taxa_total  = df_rede_orig["taxa_final"].sum()    if "taxa_final"    in df_rede_orig.columns else 0
+val_ofx_rede  = df_ofx_rede["valor_ofx"].apply(lambda v: v if v > 0 else 0).sum()
+val_rede_bruto = df_rede_orig["valor_bruto"].sum()  if "valor_bruto"   in df_rede_orig.columns else 0
+val_rede_liq   = df_rede_orig["valor_liquido"].sum() if "valor_liquido" in df_rede_orig.columns else 0
 
 cv1, cv2, cv3, cv4 = st.columns(4)
-cv1.metric("💰 OFX — Lançamentos REDE",      f"R$ {val_ofx_rede:,.2f}",
-           help="Soma dos lançamentos OFX com 'REDE' no memo (excluindo SALDO TOTAL)")
-cv2.metric("💳 Intermediadora — Valor Bruto",  f"R$ {val_rede_bruto:,.2f}")
-cv3.metric("🏦 Intermediadora — Valor Líquido", f"R$ {val_rede_liq:,.2f}")
+cv1.metric("💰 OFX — Lançamentos REDE",          f"R$ {val_ofx_rede:,.2f}")
+cv2.metric("💳 Intermediadora — Valor Bruto",     f"R$ {val_rede_bruto:,.2f}")
+cv3.metric("🏦 Intermediadora — Valor Líquido",   f"R$ {val_rede_liq:,.2f}")
 cv4.metric("📊 Diferença OFX × Líquido",
            f"R$ {val_ofx_rede - val_rede_liq:,.2f}",
            delta=f"{((val_ofx_rede - val_rede_liq)/val_rede_liq*100):.2f}%" if val_rede_liq else None)
@@ -398,86 +438,277 @@ cv4.metric("📊 Diferença OFX × Líquido",
 st.divider()
 
 # ─────────────────────────────────────────────
-# RESUMO POR BANDEIRA E TIPO
+# ABAS PRINCIPAIS
 # ─────────────────────────────────────────────
-st.subheader("📊 Resumo por Bandeira e Tipo (Intermediadora)")
+aba_result, aba_detalhe, aba_manual, aba_outros = st.tabs([
+    "🔍 Conciliação",
+    "📋 Detalhe por Transação",
+    "🔗 Vinculação Manual",
+    "📄 Outros Lançamentos OFX",
+])
 
-tab1, tab2 = st.tabs(["Agrupado", "Detalhe por Transação"])
+# ════════════════════════════════════════════
+# ABA 1 — RESULTADO DA CONCILIAÇÃO
+# ════════════════════════════════════════════
+with aba_result:
+    st.subheader("Resultado — Grupos (Intermediadora × OFX)")
 
-with tab1:
-    df_resumo = df_rede_grupo.copy()
-    rename = {
-        "bandeira":        "Bandeira",
-        "tipo_norm":       "Tipo",
-        "valor_bruto":     "Valor Bruto (R$)",
-        "valor_liquido":   "Valor Líquido (R$)",
-        "taxa_final":      "Total Taxas (R$)",
-        "qtd_transacoes":  "Qtd Transações",
-    }
-    df_resumo = df_resumo.rename(columns={k: v for k, v in rename.items() if k in df_resumo.columns})
-    fmt_cols = {c: "R$ {:,.2f}" for c in ["Valor Bruto (R$)", "Valor Líquido (R$)", "Total Taxas (R$)"] if c in df_resumo.columns}
-    st.dataframe(df_resumo.style.format(fmt_cols), use_container_width=True)
+    # Aplica vínculos manuais na exibição
+    df_result_display = df_result.copy()
+    for ig, info in st.session_state["vinculos_manuais"].items():
+        mask = df_result_display["idx_grupo"] == ig
+        df_result_display.loc[mask, "Status"]    = info["status"]
+        df_result_display.loc[mask, "Memo OFX"]  = info.get("memo_ofx", "")
+        df_result_display.loc[mask, "Valor OFX"] = info.get("valor_ofx", "")
+        df_result_display.loc[mask, "Data OFX"]  = info.get("data_ofx", "")
 
-with tab2:
-    cols_show = [c for c in ["data", "bandeira", "tipo_norm", "tipo", "valor_bruto",
-                              "taxa_final", "taxa_pct", "valor_liquido", "cv", "estabelecimento", "status"]
-                 if c in df_rede_orig.columns]
-    rename_det = {
-        "data": "Data", "bandeira": "Bandeira", "tipo_norm": "Tipo",
-        "tipo": "Descrição Transação", "valor_bruto": "Valor Bruto",
-        "taxa_final": "Taxa (R$)", "taxa_pct": "Taxa (%)",
-        "valor_liquido": "Valor Líquido", "cv": "C.V.",
-        "estabelecimento": "Estabelecimento", "status": "Status",
-    }
-    st.dataframe(
-        df_rede_orig[cols_show].rename(columns=rename_det),
-        use_container_width=True, height=300
+    status_opcoes = df_result_display["Status"].unique().tolist()
+    filtro = st.multiselect("Filtrar por status:", options=status_opcoes,
+                             default=status_opcoes, key="filtro_resultado")
+    df_filtrado = df_result_display[df_result_display["Status"].isin(filtro)]
+
+    def fmt_brl(v):
+        try:
+            if v == "" or pd.isna(v): return ""
+            return f"R$ {float(v):,.2f}"
+        except: return v
+
+    df_show = df_filtrado.drop(columns=["idx_grupo"], errors="ignore").copy()
+    for c in ["Valor OFX", "Valor Bruto Rede", "Valor Líq. Rede", "Diferença (R$)"]:
+        if c in df_show.columns:
+            df_show[c] = df_show[c].apply(fmt_brl)
+
+    st.dataframe(df_show, use_container_width=True, height=420)
+
+# ════════════════════════════════════════════
+# ABA 2 — DETALHE POR TRANSAÇÃO
+# ════════════════════════════════════════════
+with aba_detalhe:
+    st.subheader("Detalhe por Transação Individual")
+    st.caption("Cada transação herda o status do seu grupo (Data + Bandeira + Tipo).")
+
+    df_detalhe = build_status_transacao(
+        df_rede_orig, df_rede_grupo, df_result,
+        st.session_state["vinculos_manuais"]
     )
 
-st.divider()
+    status_det_opcoes = df_detalhe["Status Conciliação"].unique().tolist()
+    filtro_det = st.multiselect("Filtrar por status:", options=status_det_opcoes,
+                                 default=status_det_opcoes, key="filtro_detalhe")
+    df_det_filtrado = df_detalhe[df_detalhe["Status Conciliação"].isin(filtro_det)]
 
-# ─────────────────────────────────────────────
-# RESULTADO DA CONCILIAÇÃO
-# ─────────────────────────────────────────────
-st.subheader("🔍 Resultado da Conciliação")
+    cols_show = ["Status Conciliação", "data", "bandeira", "tipo_norm", "tipo",
+                 "valor_bruto", "taxa_final", "taxa_pct", "valor_liquido",
+                 "cv", "estabelecimento", "status_adq",
+                 "Memo OFX Vinculado", "Valor OFX Vinculado"]
+    cols_show = [c for c in cols_show if c in df_det_filtrado.columns]
 
-status_opcoes = df_result["Status"].unique().tolist()
-filtro = st.multiselect("Filtrar por status:", options=status_opcoes, default=status_opcoes)
-df_filtrado = df_result[df_result["Status"].isin(filtro)]
+    rename_det = {
+        "Status Conciliação":  "Status",
+        "data":                "Data",
+        "bandeira":            "Bandeira",
+        "tipo_norm":           "Tipo",
+        "tipo":                "Descrição",
+        "valor_bruto":         "Valor Bruto",
+        "taxa_final":          "Taxa (R$)",
+        "taxa_pct":            "Taxa (%)",
+        "valor_liquido":       "Valor Líquido",
+        "cv":                  "C.V.",
+        "estabelecimento":     "Estabelecimento",
+        "status_adq":          "Status Adquirente",
+        "Memo OFX Vinculado":  "Memo OFX",
+        "Valor OFX Vinculado": "Valor OFX",
+    }
 
-def fmt_brl(v):
-    try:
-        if v == "" or pd.isna(v): return ""
-        return f"R$ {float(v):,.2f}"
-    except: return v
+    df_det_show = df_det_filtrado[cols_show].rename(columns=rename_det).copy()
+    for c in ["Valor Bruto", "Valor Líquido", "Taxa (R$)"]:
+        if c in df_det_show.columns:
+            df_det_show[c] = df_det_show[c].apply(
+                lambda v: f"R$ {v:,.2f}" if pd.notna(v) and v != "" else ""
+            )
 
-df_display = df_filtrado.copy()
-for c in ["Valor OFX", "Valor Bruto Rede", "Valor Líq. Rede", "Diferença (R$)"]:
-    if c in df_display.columns:
-        df_display[c] = df_display[c].apply(fmt_brl)
+    st.dataframe(df_det_show, use_container_width=True, height=450)
 
-st.dataframe(df_display, use_container_width=True, height=400)
+    with st.expander("📊 Resumo por status"):
+        resumo_status = df_detalhe["Status Conciliação"].value_counts().reset_index()
+        resumo_status.columns = ["Status", "Qtd Transações"]
+        st.dataframe(resumo_status, use_container_width=True)
 
-# ─────────────────────────────────────────────
-# OUTROS LANÇAMENTOS OFX (não REDE)
-# ─────────────────────────────────────────────
-if not df_ofx_outros.empty:
-    with st.expander(f"📋 Outros lançamentos OFX — não relacionados à Rede ({len(df_ofx_outros)} registros)"):
-        df_outros_display = df_ofx_outros[['data','valor_ofx','memo']].copy()
-        df_outros_display['valor_ofx'] = df_outros_display['valor_ofx'].apply(lambda v: f"R$ {v:,.2f}")
-        df_outros_display = df_outros_display.rename(columns={'data':'Data','valor_ofx':'Valor','memo':'Memo'})
-        st.dataframe(df_outros_display, use_container_width=True)
-        total_outros = df_ofx_outros['valor_ofx'].apply(lambda v: v if v > 0 else 0).sum()
-        st.caption(f"Total créditos outros lançamentos: R$ {total_outros:,.2f}")
+# ════════════════════════════════════════════
+# ABA 3 — VINCULAÇÃO MANUAL
+# ════════════════════════════════════════════
+with aba_manual:
+    st.subheader("🔗 Vinculação Manual de Lançamentos")
+    st.info(
+        "Associe grupos não conciliados da intermediadora a lançamentos OFX pendentes. "
+        "Somente grupos ❌ estão disponíveis. Grupos ✅ ou ⚠️ não podem ser alterados.",
+        icon="ℹ️"
+    )
+
+    grupos_elegiveis = grupos_nao_conc[
+        ~grupos_nao_conc["idx_grupo"].isin(grupos_vinculados_manual)
+    ].copy()
+
+    if grupos_elegiveis.empty and not grupos_vinculados_manual:
+        st.success("✅ Não há grupos pendentes para vinculação manual.")
+    elif grupos_elegiveis.empty:
+        st.success("✅ Todos os grupos não conciliados já foram vinculados manualmente!")
+    else:
+        # ── 1. Seleção do grupo da Rede ─────────
+        st.markdown("#### 1. Selecione o grupo não conciliado")
+
+        opcoes_grupo = []
+        for _, row in grupos_elegiveis.iterrows():
+            val_liq = float(row["Valor Líq. Rede"]) if row["Valor Líq. Rede"] != "" else 0.0
+            label = (f"{row['Data Rede']}  |  {row['Bandeira Rede']} {row['Tipo Rede']}  |  "
+                     f"R$ {val_liq:,.2f}  |  {int(row['Qtd Transações'])} transações")
+            opcoes_grupo.append((label, row["idx_grupo"]))
+
+        labels_grupo  = [o[0] for o in opcoes_grupo]
+        indices_grupo = [o[1] for o in opcoes_grupo]
+
+        sel_label     = st.selectbox("Grupo:", labels_grupo, key="sel_grupo")
+        sel_idx_grupo = indices_grupo[labels_grupo.index(sel_label)]
+
+        # Exibe transações do grupo
+        grupo_row         = df_rede_grupo[df_rede_grupo["idx_grupo"] == sel_idx_grupo].iloc[0]
+        idxs_grupo        = grupo_row["idx_transacao"]
+        df_trans_grupo    = df_rede_orig[df_rede_orig["idx_transacao"].isin(idxs_grupo)].copy()
+
+        with st.expander(f"🧾 Transações do grupo selecionado ({len(df_trans_grupo)} itens)", expanded=True):
+            df_tg_show = df_trans_grupo[
+                ["data", "bandeira", "tipo_norm", "valor_bruto", "taxa_final", "valor_liquido", "cv"]
+            ].rename(columns={
+                "data": "Data", "bandeira": "Bandeira", "tipo_norm": "Tipo",
+                "valor_bruto": "Valor Bruto", "taxa_final": "Taxa (R$)",
+                "valor_liquido": "Valor Líquido", "cv": "C.V."
+            })
+            for c in ["Valor Bruto", "Taxa (R$)", "Valor Líquido"]:
+                df_tg_show[c] = df_tg_show[c].apply(lambda v: f"R$ {v:,.2f}")
+            st.dataframe(df_tg_show, use_container_width=True)
+
+            t1, t2, t3 = st.columns(3)
+            t1.metric("Total Bruto",   f"R$ {df_trans_grupo['valor_bruto'].sum():,.2f}")
+            t2.metric("Total Taxas",   f"R$ {df_trans_grupo['taxa_final'].sum():,.2f}")
+            t3.metric("Total Líquido", f"R$ {df_trans_grupo['valor_liquido'].sum():,.2f}")
+
+        # ── 2. Seleção do lançamento OFX ────────
+        st.markdown("#### 2. Selecione o lançamento OFX pendente")
+
+        if df_ofx_pendentes.empty:
+            st.warning("Não há lançamentos OFX REDE pendentes para vincular.")
+        else:
+            opcoes_ofx = []
+            for _, row in df_ofx_pendentes.iterrows():
+                label = f"{row['data']}  |  {row['memo']}  |  R$ {row['valor_ofx']:,.2f}"
+                opcoes_ofx.append((label, row))
+
+            labels_ofx    = [o[0] for o in opcoes_ofx]
+            sel_ofx_label = st.selectbox("Lançamento OFX:", labels_ofx, key="sel_ofx")
+            sel_ofx_row   = opcoes_ofx[labels_ofx.index(sel_ofx_label)][1]
+
+            # ── 3. Conferência de valores ────────
+            st.markdown("#### 3. Conferência de valores")
+            val_grupo = float(grupo_row.get("valor_liquido", 0))
+            val_ofx_s = float(sel_ofx_row["valor_ofx"])
+            diff_val  = abs(val_ofx_s) - val_grupo
+            diff_pct  = (diff_val / val_grupo * 100) if val_grupo else 0
+
+            m1, m2, m3 = st.columns(3)
+            m1.metric("Valor OFX",               f"R$ {abs(val_ofx_s):,.2f}")
+            m2.metric("Valor Líq. Intermediadora", f"R$ {val_grupo:,.2f}")
+            m3.metric("Diferença",               f"R$ {diff_val:,.2f}",
+                      delta=f"{diff_pct:.2f}%",
+                      delta_color="off" if abs(diff_val) < 0.01 else "inverse")
+
+            obs = st.text_input("Observação (opcional):", key="obs_manual",
+                                 placeholder="Ex: diferença por ajuste de taxa no feriado")
+
+            # Bloqueia se diferença > 10%
+            diff_bloqueio = abs(diff_pct) > 10
+            if diff_bloqueio:
+                st.error(f"⛔ Diferença de {diff_pct:.1f}% acima de 10%. "
+                          "Revise se este é o lançamento correto antes de confirmar.")
+
+            col_btn, _ = st.columns([1, 3])
+            with col_btn:
+                confirmar = st.button(
+                    "✅ Confirmar Vínculo", type="primary",
+                    use_container_width=True, disabled=diff_bloqueio
+                )
+
+            if confirmar:
+                status_manual = "🔗 Vinculado Manualmente" if abs(diff_val) < 0.01 else "🔗 Vinculado c/ Divergência"
+                st.session_state["vinculos_manuais"][sel_idx_grupo] = {
+                    "status":     status_manual,
+                    "memo_ofx":   sel_ofx_row["memo"],
+                    "valor_ofx":  sel_ofx_row["valor_ofx"],
+                    "data_ofx":   sel_ofx_row["data"],
+                    "observacao": obs,
+                    "diff_valor": diff_val,
+                }
+                st.success(f"✅ Vínculo registrado com **{sel_ofx_row['memo']}**!")
+                st.rerun()
+
+    # ── Lista de vínculos registrados ───────────
+    if st.session_state["vinculos_manuais"]:
+        st.divider()
+        st.markdown("#### Vínculos manuais registrados nesta sessão")
+
+        registros = []
+        for ig, info in st.session_state["vinculos_manuais"].items():
+            g_rows = df_rede_grupo[df_rede_grupo["idx_grupo"] == ig]
+            if not g_rows.empty:
+                g = g_rows.iloc[0]
+                registros.append({
+                    "Status":           info["status"],
+                    "Data Rede":        str(g.get("data", "")),
+                    "Bandeira":         g.get("bandeira", ""),
+                    "Tipo":             g.get("tipo_norm", ""),
+                    "Valor Líq. Rede":  f"R$ {float(g.get('valor_liquido', 0)):,.2f}",
+                    "Memo OFX":         info.get("memo_ofx", ""),
+                    "Valor OFX":        f"R$ {abs(float(info.get('valor_ofx', 0))):,.2f}",
+                    "Diferença":        f"R$ {float(info.get('diff_valor', 0)):,.2f}",
+                    "Observação":       info.get("observacao", ""),
+                })
+
+        df_vinculos = pd.DataFrame(registros)
+        st.dataframe(df_vinculos, use_container_width=True)
+
+        if st.button("🗑️ Limpar todos os vínculos manuais", type="secondary"):
+            st.session_state["vinculos_manuais"] = {}
+            st.rerun()
+
+# ════════════════════════════════════════════
+# ABA 4 — OUTROS LANÇAMENTOS OFX
+# ════════════════════════════════════════════
+with aba_outros:
+    st.subheader("Outros Lançamentos OFX — Não Relacionados à Rede")
+    if df_ofx_outros.empty:
+        st.info("Nenhum lançamento OFX fora do escopo da Rede.")
+    else:
+        df_out = df_ofx_outros[["data", "valor_ofx", "memo"]].copy()
+        df_out["valor_ofx"] = df_out["valor_ofx"].apply(lambda v: f"R$ {v:,.2f}")
+        df_out = df_out.rename(columns={"data": "Data", "valor_ofx": "Valor", "memo": "Memo"})
+        st.dataframe(df_out, use_container_width=True)
+        total_outros = df_ofx_outros["valor_ofx"].apply(lambda v: v if v > 0 else 0).sum()
+        st.metric("Total créditos", f"R$ {total_outros:,.2f}")
 
 st.divider()
 
 # ─────────────────────────────────────────────
 # EXPORTAR
 # ─────────────────────────────────────────────
-excel_bytes = exportar_excel(df_result, df_rede_orig, df_rede_grupo)
+df_detalhe_export = build_status_transacao(
+    df_rede_orig, df_rede_grupo, df_result,
+    st.session_state["vinculos_manuais"]
+)
+excel_bytes = exportar_excel(
+    df_result, df_detalhe_export, df_rede_grupo,
+    st.session_state["vinculos_manuais"]
+)
 st.download_button(
-    label="⬇️ Exportar Resultado Excel",
+    label="⬇️ Exportar Resultado Completo (Excel)",
     data=excel_bytes,
     file_name=f"conciliacao_{datetime.today().strftime('%Y%m%d_%H%M')}.xlsx",
     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
