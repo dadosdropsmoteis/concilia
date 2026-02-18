@@ -335,8 +335,8 @@ Colunas utilizadas: `DATA VENDA`, `BANDEIRA`, `TRANSAÇÃO`, `VALOR BRUTO`, `VAL
 
 with st.spinner("Processando arquivos..."):
     try:
-        df_ofx = parse_ofx(file_ofx.read())
-        if df_ofx.empty:
+        df_ofx_raw = parse_ofx(file_ofx.read())
+        if df_ofx_raw.empty:
             st.error("Nenhuma transação encontrada no OFX."); st.stop()
     except Exception as e:
         st.error(f"Erro ao ler OFX: {e}"); st.stop()
@@ -348,11 +348,20 @@ with st.spinner("Processando arquivos..."):
     except Exception as e:
         st.error(f"Erro ao ler arquivo da intermediadora: {e}"); st.stop()
 
+# ── Filtros OFX ──────────────────────────────
+# 1. Remove registros de saldo (SALDO TOTAL)
+df_ofx = df_ofx_raw[~df_ofx_raw["memo"].str.upper().str.contains("SALDO TOTAL", na=False)].copy()
+
+# 2. Separa lancamentos REDE (usados na conciliacao) dos demais
+df_ofx_rede   = df_ofx[df_ofx["memo"].str.upper().str.contains("REDE", na=False)].copy()
+df_ofx_outros = df_ofx[~df_ofx["memo"].str.upper().str.contains("REDE", na=False)].copy()
+
 if col_valor_rede == "Valor Bruto" and "valor_bruto" in df_rede_orig.columns:
     df_rede_orig["valor_liquido"] = df_rede_orig["valor_bruto"]
 
 df_rede_grupo = agrupar_rede(df_rede_orig)
-df_result     = conciliar(df_ofx, df_rede_grupo, tolerancia_dias, tolerancia_valor)
+# Conciliacao usa apenas os lancamentos OFX com "REDE" no memo
+df_result     = conciliar(df_ofx_rede, df_rede_grupo, tolerancia_dias, tolerancia_valor)
 
 # ─────────────────────────────────────────────
 # KPIs
@@ -369,16 +378,22 @@ c2.metric("✅ Conciliados",        f"{conciliados} ({pct(conciliados)})")
 c3.metric("⚠️ Com Divergência",    f"{divergentes} ({pct(divergentes)})")
 c4.metric("❌ Não Conciliados",    f"{nao_conc} ({pct(nao_conc)})")
 
-# Valor total OFX vs Rede
-val_ofx_total  = df_ofx["valor_ofx"].apply(lambda v: v if v > 0 else 0).sum()
-val_rede_total = df_rede_orig["valor_liquido"].sum() if "valor_liquido" in df_rede_orig.columns else 0
-val_taxa_total = df_rede_orig["taxa_final"].sum()   if "taxa_final"    in df_rede_orig.columns else 0
+# Valores para KPIs
+# OFX: apenas lancamentos REDE (positivos) — os mesmos usados na conciliacao
+val_ofx_rede   = df_ofx_rede["valor_ofx"].apply(lambda v: v if v > 0 else 0).sum()
+val_ofx_outros = df_ofx_outros["valor_ofx"].apply(lambda v: v if v > 0 else 0).sum()
+val_rede_bruto  = df_rede_orig["valor_bruto"].sum()  if "valor_bruto"   in df_rede_orig.columns else 0
+val_rede_liq    = df_rede_orig["valor_liquido"].sum() if "valor_liquido" in df_rede_orig.columns else 0
+val_taxa_total  = df_rede_orig["taxa_final"].sum()    if "taxa_final"    in df_rede_orig.columns else 0
 
 cv1, cv2, cv3, cv4 = st.columns(4)
-cv1.metric("💰 Total Créditos OFX",    f"R$ {val_ofx_total:,.2f}")
-cv2.metric("💳 Total Bruto Intermediadora", f"R$ {df_rede_orig['valor_bruto'].sum():,.2f}" if "valor_bruto" in df_rede_orig.columns else "—")
-cv3.metric("🏦 Total Líquido Intermediadora", f"R$ {val_rede_total:,.2f}")
-cv4.metric("📊 Diferença OFX × Líquido", f"R$ {val_ofx_total - val_rede_total:,.2f}")
+cv1.metric("💰 OFX — Lançamentos REDE",      f"R$ {val_ofx_rede:,.2f}",
+           help="Soma dos lançamentos OFX com 'REDE' no memo (excluindo SALDO TOTAL)")
+cv2.metric("💳 Intermediadora — Valor Bruto",  f"R$ {val_rede_bruto:,.2f}")
+cv3.metric("🏦 Intermediadora — Valor Líquido", f"R$ {val_rede_liq:,.2f}")
+cv4.metric("📊 Diferença OFX × Líquido",
+           f"R$ {val_ofx_rede - val_rede_liq:,.2f}",
+           delta=f"{((val_ofx_rede - val_rede_liq)/val_rede_liq*100):.2f}%" if val_rede_liq else None)
 
 st.divider()
 
@@ -442,6 +457,18 @@ for c in ["Valor OFX", "Valor Bruto Rede", "Valor Líq. Rede", "Diferença (R$)"
         df_display[c] = df_display[c].apply(fmt_brl)
 
 st.dataframe(df_display, use_container_width=True, height=400)
+
+# ─────────────────────────────────────────────
+# OUTROS LANÇAMENTOS OFX (não REDE)
+# ─────────────────────────────────────────────
+if not df_ofx_outros.empty:
+    with st.expander(f"📋 Outros lançamentos OFX — não relacionados à Rede ({len(df_ofx_outros)} registros)"):
+        df_outros_display = df_ofx_outros[['data','valor_ofx','memo']].copy()
+        df_outros_display['valor_ofx'] = df_outros_display['valor_ofx'].apply(lambda v: f"R$ {v:,.2f}")
+        df_outros_display = df_outros_display.rename(columns={'data':'Data','valor_ofx':'Valor','memo':'Memo'})
+        st.dataframe(df_outros_display, use_container_width=True)
+        total_outros = df_ofx_outros['valor_ofx'].apply(lambda v: v if v > 0 else 0).sum()
+        st.caption(f"Total créditos outros lançamentos: R$ {total_outros:,.2f}")
 
 st.divider()
 
