@@ -1329,76 +1329,110 @@ with aba_caixa:
         # ── Resumo por caixa ───────────────────
         st.markdown("#### Resumo por Caixa e Forma de Pagamento")
 
-        # Pivot base com valores numéricos por caixa × forma
-        resumo_pivot_num = df_caixa.groupby(["Caixa", "forma_norm"])["valor"].sum().unstack(fill_value=0)
-        resumo_pivot_num.columns.name = None
-        resumo_pivot_num["TOTAL"] = resumo_pivot_num.sum(axis=1)
-
-        # Calcula status de conciliação por caixa para CREDITO e DEBITO
-        # Para cada caixa: se todos conciliados → ✅, se algum divergente → ⚠️, se algum não encontrado → ❌
+        # ── Helpers de status de conciliação ──
         def status_conc_por_caixa(df_conc: pd.DataFrame, forma: str) -> dict:
-            """Retorna dict {caixa: emoji_status} para uma forma de pagamento."""
+            """Retorna dict {caixa: emoji} — prioridade: ❌ > ⚠️ > 🔗 > ✅."""
             resultado = {}
-            sub = df_conc[df_conc["forma_norm"] == forma].copy()
+            sub = df_conc[df_conc["forma_norm"] == forma]
             for caixa, grp in sub.groupby("Caixa"):
-                statuses = grp["Status"].tolist()
-                if any("❌" in s for s in statuses):
-                    resultado[caixa] = "❌"
-                elif any("⚠️" in s for s in statuses):
-                    resultado[caixa] = "⚠️"
-                elif any("🔗" in s for s in statuses):
-                    resultado[caixa] = "🔗"
-                else:
-                    resultado[caixa] = "✅"
+                ss = grp["Status"].tolist()
+                if any("❌" in s for s in ss):   resultado[caixa] = "❌"
+                elif any("⚠️" in s for s in ss): resultado[caixa] = "⚠️"
+                elif any("🔗" in s for s in ss): resultado[caixa] = "🔗"
+                else:                             resultado[caixa] = "✅"
             return resultado
+
+        def status_geral_caixa(cx, status_dict_list):
+            """Combina múltiplos dicts de status para um caixa → emoji mais grave."""
+            emojis = [d.get(cx, "") for d in status_dict_list if cx in d]
+            if not emojis: return "—"
+            if any("❌" in e for e in emojis):   return "❌"
+            if any("⚠️" in e for e in emojis):  return "⚠️"
+            if any("🔗" in e for e in emojis):   return "🔗"
+            return "✅"
 
         status_cred = status_conc_por_caixa(df_conc_caixa, "CREDITO")
         status_deb  = status_conc_por_caixa(df_conc_caixa, "DEBITO")
+        # PIX: será implementado com módulo PIX — por ora fica vazio
+        status_pix  = {}   # placeholder para futura conciliação PIX
 
-        # Monta pivot de exibição — status em colunas separadas (garantem renderização do emoji)
-        resumo_pivot_disp = resumo_pivot_num.copy().reset_index()
+        # ── Pivot numérico base ──
+        pivot_num = df_caixa.groupby(["Caixa", "forma_norm"])["valor"].sum().unstack(fill_value=0)
+        pivot_num.columns.name = None
+        pivot_num = pivot_num.reset_index()
 
-        # Formata valores monetários
-        for c in resumo_pivot_disp.columns:
-            if c == "Caixa": continue
-            resumo_pivot_disp[c] = resumo_pivot_disp[c].apply(
-                lambda v: f"R$ {v:,.2f}" if isinstance(v, (int, float)) else v)
+        # Normaliza nomes das formas para lookup (uppercase)
+        forma_map = {c: c for c in pivot_num.columns if c != "Caixa"}
 
-        # Injeta colunas de status logo após CREDITO e DEBITO
-        def inserir_apos(df, col_ref, nova_col, valores):
-            """Insere nova_col imediatamente após col_ref."""
-            if col_ref not in df.columns:
-                return df
-            pos = df.columns.get_loc(col_ref) + 1
-            df.insert(pos, nova_col, valores)
-            return df
+        def val(row, forma):
+            """Retorna valor numérico de uma forma ou 0."""
+            return float(row.get(forma, 0) or 0)
 
-        label_cred = resumo_pivot_disp["Caixa"].map(
-            lambda cx: status_cred.get(cx, "—") if cx in status_cred else "—")
-        label_deb  = resumo_pivot_disp["Caixa"].map(
-            lambda cx: status_deb.get(cx, "—") if cx in status_deb else "—")
+        # ── Monta DataFrame final com colunas na ordem solicitada ──
+        rows_disp = []
+        conc_hint = "✅ Tudo conciliado  |  ⚠️ Divergência  |  🔗 Vinculado manualmente  |  ❌ Não conciliado  |  — Sem transações"
 
-        if "CREDITO" in resumo_pivot_disp.columns:
-            resumo_pivot_disp = inserir_apos(resumo_pivot_disp, "CREDITO", "Conc. Créd.", label_cred)
-        if "DEBITO" in resumo_pivot_disp.columns:
-            resumo_pivot_disp = inserir_apos(resumo_pivot_disp, "DEBITO", "Conc. Déb.", label_deb)
+        for _, row in pivot_num.iterrows():
+            cx = row["Caixa"]
 
-        resumo_pivot_disp = resumo_pivot_disp.rename(columns={"Caixa": "Nº Caixa"})
+            v_din    = val(row, "DINHEIRO")
+            v_cred   = val(row, "CREDITO")
+            v_deb    = val(row, "DEBITO")
+            v_pix    = val(row, "PIX")
+            v_book   = val(row, "BOOKING")
+            v_ggr    = val(row, "GUIA GO RECEBER")
+            v_ggt    = val(row, "GUIA GO TAXA")
+            v_dup    = val(row, "DUPLICATA")
+            v_cort   = val(row, "CORTESIA")
 
-        # Monta column_config explícito para forçar TextColumn em todas as colunas
+            v_receita = v_din + v_cred + v_deb + v_pix + v_book + v_ggr
+            v_total   = v_receita + v_ggt + v_dup + v_cort
+
+            sc = status_cred.get(cx, "—")
+            sd = status_deb.get(cx, "—")
+            sp = status_pix.get(cx, "—")
+            sg = status_geral_caixa(cx, [status_cred, status_deb, status_pix])
+
+            def fmt(v): return f"R$ {v:,.2f}" if v else "R$ 0,00"
+
+            rows_disp.append({
+                "Nº Caixa":        cx,
+                "Conc.":           sg,
+                "Dinheiro":        fmt(v_din),
+                "Crédito":         fmt(v_cred),
+                "Conc. Créd.":     sc,
+                "Débito":          fmt(v_deb),
+                "Conc. Déb.":      sd,
+                "PIX":             fmt(v_pix),
+                "Conc. PIX":       sp,
+                "Booking":         fmt(v_book),
+                "Guia Go Rec.":    fmt(v_ggr),
+                "Valor Receita":   fmt(v_receita),
+                "Guia Go Taxa":    fmt(v_ggt),
+                "Duplicata":       fmt(v_dup),
+                "Cortesia":        fmt(v_cort),
+                "Valor Total":     fmt(v_total),
+            })
+
+        df_pivot_disp = pd.DataFrame(rows_disp)
+
+        # ── column_config: oculta nada, TextColumn em tudo, status pequenos ──
+        COLS_STATUS  = {"Conc.", "Conc. Créd.", "Conc. Déb.", "Conc. PIX"}
+        COLS_VALOR   = {"Nº Caixa", "Dinheiro", "Crédito", "Débito", "PIX",
+                        "Booking", "Guia Go Rec.", "Valor Receita",
+                        "Guia Go Taxa", "Duplicata", "Cortesia", "Valor Total"}
         col_cfg = {}
-        for c in resumo_pivot_disp.columns:
-            if c in ("Conc. Créd.", "Conc. Déb."):
+        for c in df_pivot_disp.columns:
+            if c in COLS_STATUS:
                 col_cfg[c] = st.column_config.TextColumn(c, width="small",
-                                help="✅ Conciliado  ⚠️ Com divergência  ❌ Não encontrado")
+                    help=conc_hint)
             else:
-                col_cfg[c] = st.column_config.TextColumn(c)
+                col_cfg[c] = st.column_config.TextColumn(c, width="medium")
 
-        st.dataframe(resumo_pivot_disp, use_container_width=True,
+        st.dataframe(df_pivot_disp, use_container_width=True,
                      column_config=col_cfg, hide_index=True)
 
-        # Legenda dos status de conciliação
-        st.caption("✅ Totalmente conciliado  |  ⚠️ Com divergência de valor/chave  |  ❌ Itens não encontrados na intermediadora  |  — Sem transações de cartão")
+        st.caption(conc_hint)
 
         # Totais gerais
         tc1, tc2, tc3 = st.columns(3)
@@ -1479,7 +1513,7 @@ with aba_caixa:
                         df_ed_cx,
                         column_config={
                             "✔":          st.column_config.CheckboxColumn("✔",        width="small"),
-                            "_idx":       st.column_config.NumberColumn("_idx",       width="small"),
+                            "_idx":       None,   # oculta coluna técnica
                             "Status":     st.column_config.TextColumn("Status",       width="medium"),
                             "Caixa":      st.column_config.TextColumn("Caixa",        width="small"),
                             "Forma":      st.column_config.TextColumn("Forma",        width="small"),
@@ -1516,7 +1550,7 @@ with aba_caixa:
                         df_ed_rede,
                         column_config={
                             "✔":            st.column_config.CheckboxColumn("✔",       width="small"),
-                            "_idx":         st.column_config.NumberColumn("_idx",      width="small"),
+                            "_idx":         None,   # oculta coluna técnica
                             "Status":       st.column_config.TextColumn("Status",      width="medium"),
                             "C.V. Rede":    st.column_config.TextColumn("C.V.",        width="medium"),
                             "Data Rede":    st.column_config.TextColumn("Data",        width="small"),
