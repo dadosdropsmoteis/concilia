@@ -503,9 +503,17 @@ with aba_result:
     st.subheader("Resultado — Grupos (Intermediadora × OFX)")
 
     # Aplica vínculos manuais na exibição
+    # Vínculos virtuais (por idx_transacao) não têm idx_grupo — são ignorados aqui,
+    # pois o status deles aparece no Detalhe por Transação
     df_result_display = df_result.copy()
     for ig, info in st.session_state["vinculos_manuais"].items():
-        mask = df_result_display["idx_grupo"] == int(ig)
+        if info.get("virtual"):
+            continue  # vínculo por transação individual — sem idx_grupo no resultado
+        try:
+            ig_int = int(ig)
+        except (ValueError, TypeError):
+            continue
+        mask = df_result_display["idx_grupo"] == ig_int
         df_result_display.loc[mask, "Status"]    = info["status"]
         df_result_display.loc[mask, "Memo OFX"]  = info.get("memo_ofx", "")
         df_result_display.loc[mask, "Valor OFX"] = info.get("valor_ofx", "")
