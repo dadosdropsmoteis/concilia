@@ -231,23 +231,42 @@ def build_status_transacao(df_rede_orig: pd.DataFrame,
                             df_rede_grupo: pd.DataFrame,
                             df_result: pd.DataFrame,
                             vinculos_manuais: dict) -> pd.DataFrame:
-    """Propaga status do grupo (conciliação auto + manual) para cada transação individual."""
-    # Mapa idx_grupo → status (automático)
-    status_grupo = {}
-    memo_grupo   = {}
-    valor_grupo  = {}
+    """Propaga status do grupo (auto + manual) para cada transação individual.
+    Vínculos manuais podem ser por idx_grupo (legado) ou por idx_transacao direta (virtual).
+    """
+    # ── Status automáticos: idx_grupo → status ──
+    status_por_grupo = {}
+    memo_por_grupo   = {}
+    valor_por_grupo  = {}
     for _, row in df_result.iterrows():
         ig = row["idx_grupo"]
         if ig is not None:
-            status_grupo[ig] = row["Status"]
-            memo_grupo[ig]   = row.get("Memo OFX", "")
-            valor_grupo[ig]  = row.get("Valor OFX", "")
+            status_por_grupo[ig] = row["Status"]
+            memo_por_grupo[ig]   = row.get("Memo OFX", "")
+            valor_por_grupo[ig]  = row.get("Valor OFX", "")
 
-    # Sobrescreve com vínculos manuais
-    for ig, info in vinculos_manuais.items():
-        status_grupo[int(ig)] = info["status"]
-        memo_grupo[int(ig)]   = info.get("memo_ofx", "")
-        valor_grupo[int(ig)]  = info.get("valor_ofx", "")
+    # ── Vínculos manuais: podem ser por idx_grupo ou por idx_transacao ──
+    # status_por_transacao tem prioridade sobre status_por_grupo
+    status_por_transacao = {}
+    memo_por_transacao   = {}
+    valor_por_transacao  = {}
+
+    for chave, info in vinculos_manuais.items():
+        if info.get("virtual"):
+            # Vínculo direto por transação individual
+            for idx_t in info.get("idx_transacoes", []):
+                status_por_transacao[idx_t] = info["status"]
+                memo_por_transacao[idx_t]   = info.get("memo_ofx", "")
+                valor_por_transacao[idx_t]  = info.get("valor_ofx", "")
+        else:
+            # Vínculo por grupo (legado)
+            try:
+                ig = int(chave)
+                status_por_grupo[ig] = info["status"]
+                memo_por_grupo[ig]   = info.get("memo_ofx", "")
+                valor_por_grupo[ig]  = info.get("valor_ofx", "")
+            except (ValueError, TypeError):
+                pass
 
     # Mapa idx_transacao → idx_grupo
     mapa_idx = {}
@@ -256,12 +275,32 @@ def build_status_transacao(df_rede_orig: pd.DataFrame,
             mapa_idx[idx_t] = row["idx_grupo"]
 
     df = df_rede_orig.copy()
-    df["idx_grupo"]          = df["idx_transacao"].map(mapa_idx)
-    df["Status Conciliação"] = df["idx_grupo"].map(
-        lambda ig: status_grupo.get(ig, "❌ Não Conciliado (Rede)")
-    )
-    df["Memo OFX Vinculado"]  = df["idx_grupo"].map(lambda ig: memo_grupo.get(ig, ""))
-    df["Valor OFX Vinculado"] = df["idx_grupo"].map(lambda ig: valor_grupo.get(ig, ""))
+    df["idx_grupo"] = df["idx_transacao"].map(mapa_idx)
+
+    def get_status(row):
+        idx_t = row["idx_transacao"]
+        if idx_t in status_por_transacao:
+            return status_por_transacao[idx_t]
+        ig = row["idx_grupo"]
+        return status_por_grupo.get(ig, "❌ Não Conciliado (Rede)")
+
+    def get_memo(row):
+        idx_t = row["idx_transacao"]
+        if idx_t in memo_por_transacao:
+            return memo_por_transacao[idx_t]
+        ig = row["idx_grupo"]
+        return memo_por_grupo.get(ig, "")
+
+    def get_valor(row):
+        idx_t = row["idx_transacao"]
+        if idx_t in valor_por_transacao:
+            return valor_por_transacao[idx_t]
+        ig = row["idx_grupo"]
+        return valor_por_grupo.get(ig, "")
+
+    df["Status Conciliação"] = df.apply(get_status, axis=1)
+    df["Memo OFX Vinculado"]  = df.apply(get_memo,   axis=1)
+    df["Valor OFX Vinculado"] = df.apply(get_valor,  axis=1)
 
     return df
 
@@ -412,13 +451,18 @@ grupos_nao_conc = df_result[
 ].copy()
 grupos_nao_conc["idx_grupo"] = grupos_nao_conc["idx_grupo"].astype(int)
 grupos_vinculados_manual = set(st.session_state["vinculos_manuais"].keys())
+# Índices de transações já vinculadas manualmente (virtuais)
+transacoes_ja_vinculadas = set()
+for info in st.session_state["vinculos_manuais"].values():
+    for idx_t in info.get("idx_transacoes", []):
+        transacoes_ja_vinculadas.add(idx_t)
 
 # ─────────────────────────────────────────────
 # KPIs
 # ─────────────────────────────────────────────
 total_grupos    = len(df_rede_grupo)
 total_conc_auto = df_result["Status"].str.contains("✅|⚠️", regex=True).sum()
-total_manual    = len(grupos_vinculados_manual)
+total_manual    = len(st.session_state["vinculos_manuais"])
 total_pendentes = max(len(grupos_nao_conc) - total_manual, 0)
 pct = lambda n: f"{n/total_grupos*100:.1f}%" if total_grupos else "0%"
 
@@ -545,131 +589,137 @@ with aba_detalhe:
 with aba_manual:
     st.subheader("🔗 Vinculação Manual de Lançamentos")
     st.info(
-        "Associe grupos não conciliados da intermediadora a lançamentos OFX pendentes. "
-        "Somente grupos ❌ estão disponíveis. Grupos ✅ ou ⚠️ não podem ser alterados.",
+        "Selecione um **lançamento OFX pendente**, depois marque as **transações individuais** "
+        "da intermediadora que compõem esse valor. Somente lançamentos ❌ estão disponíveis.",
         icon="ℹ️"
     )
 
-    grupos_elegiveis = grupos_nao_conc[
-        ~grupos_nao_conc["idx_grupo"].isin([int(k) for k in grupos_vinculados_manual])
-    ].copy()
+    # Índices de transações já vinculadas manualmente (não podem ser reusadas)
+    transacoes_vinculadas = set()
+    for info in st.session_state["vinculos_manuais"].values():
+        for idx_t in info.get("idx_transacoes", []):
+            transacoes_vinculadas.add(idx_t)
 
-    if grupos_elegiveis.empty and not grupos_vinculados_manual:
-        st.success("✅ Não há grupos pendentes para vinculação manual.")
-    elif grupos_elegiveis.empty:
-        st.success("✅ Todos os grupos não conciliados já foram vinculados manualmente!")
+    if df_ofx_pendentes.empty:
+        st.success("✅ Não há lançamentos OFX pendentes para vinculação manual.")
     else:
-        # ── 1. Seleção do grupo da Rede ─────────
-        st.markdown("#### 1. Selecione o grupo não conciliado")
+        # ── 1. Seleção do lançamento OFX ────────
+        st.markdown("#### 1. Selecione o lançamento OFX pendente")
 
-        # Monta dicionário label → idx_grupo para evitar problemas de índice
-        mapa_grupo = {}
-        for _, row in grupos_elegiveis.iterrows():
-            try:
-                val_liq = float(row["Valor Líq. Rede"]) if str(row["Valor Líq. Rede"]).strip() not in ("", "nan") else 0.0
-            except (ValueError, TypeError):
-                val_liq = 0.0
-            try:
-                qtd = int(float(str(row["Qtd Transações"]).strip())) if str(row["Qtd Transações"]).strip() not in ("", "nan") else 0
-            except (ValueError, TypeError):
-                qtd = 0
-            label = (f"{row['Data Rede']}  |  {row['Bandeira Rede']} {row['Tipo Rede']}  |  "
-                     f"R$ {val_liq:,.2f}  |  {qtd} transações")
-            ig = row["idx_grupo"]
-            if ig is None or (hasattr(ig, "__class__") and ig != ig): continue  # pula NaN
-            mapa_grupo[label] = int(ig)
+        mapa_ofx = {}
+        for _, row in df_ofx_pendentes.iterrows():
+            label = f"{row['data']}  |  {row['memo']}  |  R$ {abs(row['valor_ofx']):,.2f}"
+            mapa_ofx[label] = row
 
-        labels_grupo  = list(mapa_grupo.keys())
-        sel_label     = st.selectbox("Grupo:", labels_grupo, key="sel_grupo")
-        sel_idx_grupo = mapa_grupo.get(sel_label)
+        sel_ofx_label = st.selectbox("Lançamento OFX:", list(mapa_ofx.keys()), key="sel_ofx")
+        sel_ofx_row   = mapa_ofx.get(sel_ofx_label)
 
-        if sel_idx_grupo is None:
-            st.warning("Selecione um grupo para continuar.")
+        if sel_ofx_row is None:
+            st.warning("Selecione um lançamento OFX para continuar.")
             st.stop()
 
-        # Exibe transações do grupo
-        grupo_row         = df_rede_grupo[df_rede_grupo["idx_grupo"] == sel_idx_grupo].iloc[0]
-        idxs_grupo        = grupo_row["idx_transacao"]
-        df_trans_grupo    = df_rede_orig[df_rede_orig["idx_transacao"].isin(idxs_grupo)].copy()
+        val_ofx_s = float(sel_ofx_row["valor_ofx"])
 
-        with st.expander(f"🧾 Transações do grupo selecionado ({len(df_trans_grupo)} itens)", expanded=True):
-            df_tg_show = df_trans_grupo[
-                ["data", "bandeira", "tipo_norm", "valor_bruto", "taxa_final", "valor_liquido", "cv"]
-            ].rename(columns={
-                "data": "Data", "bandeira": "Bandeira", "tipo_norm": "Tipo",
-                "valor_bruto": "Valor Bruto", "taxa_final": "Taxa (R$)",
-                "valor_liquido": "Valor Líquido", "cv": "C.V."
-            })
-            for c in ["Valor Bruto", "Taxa (R$)", "Valor Líquido"]:
-                df_tg_show[c] = df_tg_show[c].apply(lambda v: f"R$ {v:,.2f}")
-            st.dataframe(df_tg_show, use_container_width=True)
+        # ── 2. Seleção das transações da intermediadora ──
+        st.markdown("#### 2. Selecione as transações da intermediadora")
+        st.caption("Marque transações até atingir o valor do lançamento OFX acima.")
 
-            t1, t2, t3 = st.columns(3)
-            t1.metric("Total Bruto",   f"R$ {df_trans_grupo['valor_bruto'].sum():,.2f}")
-            t2.metric("Total Taxas",   f"R$ {df_trans_grupo['taxa_final'].sum():,.2f}")
-            t3.metric("Total Líquido", f"R$ {df_trans_grupo['valor_liquido'].sum():,.2f}")
+        # Transações ainda não vinculadas a nenhum OFX (automático ou manual)
+        # Exclui transações que já foram conciliadas automaticamente
+        grupos_conciliados_auto = set(
+            df_result[df_result["Status"].str.startswith(("✅", "⚠️"))]["idx_grupo"].dropna().astype(int)
+        )
+        idxs_auto_conciliados = set()
+        for ig in grupos_conciliados_auto:
+            rows = df_rede_grupo[df_rede_grupo["idx_grupo"] == ig]
+            if not rows.empty:
+                for idx_t in rows.iloc[0]["idx_transacao"]:
+                    idxs_auto_conciliados.add(idx_t)
 
-        # ── 2. Seleção do lançamento OFX ────────
-        st.markdown("#### 2. Selecione o lançamento OFX pendente")
+        df_trans_disponiveis = df_rede_orig[
+            ~df_rede_orig["idx_transacao"].isin(idxs_auto_conciliados) &
+            ~df_rede_orig["idx_transacao"].isin(transacoes_vinculadas)
+        ].copy().reset_index(drop=True)
 
-        if df_ofx_pendentes.empty:
-            st.warning("Não há lançamentos OFX REDE pendentes para vincular.")
+        if df_trans_disponiveis.empty:
+            st.warning("Não há transações disponíveis para vinculação.")
         else:
-            # Dicionário label → row para evitar problemas de índice
-            mapa_ofx = {}
-            for _, row in df_ofx_pendentes.iterrows():
-                label = f"{row['data']}  |  {row['memo']}  |  R$ {row['valor_ofx']:,.2f}"
-                mapa_ofx[label] = row
+            # Monta tabela com checkboxes por transação
+            df_trans_disponiveis["_sel_label"] = df_trans_disponiveis.apply(
+                lambda r: (f"{r['data']}  |  {r['bandeira']} {r['tipo_norm']}  |  "
+                           f"C.V.: {r['cv']}  |  Líq: R$ {r['valor_liquido']:,.2f}"), axis=1
+            )
 
-            labels_ofx    = list(mapa_ofx.keys())
-            sel_ofx_label = st.selectbox("Lançamento OFX:", labels_ofx, key="sel_ofx")
-            sel_ofx_row   = mapa_ofx.get(sel_ofx_label)
+            selecionadas = st.multiselect(
+                "Transações a vincular:",
+                options=df_trans_disponiveis["_sel_label"].tolist(),
+                key="sel_transacoes",
+                help="Selecione as transações cujo total líquido corresponde ao valor OFX"
+            )
 
-            if sel_ofx_row is None:
-                st.warning("Selecione um lançamento OFX para continuar.")
-                st.stop()
+            # Calcula total selecionado
+            df_sel = df_trans_disponiveis[df_trans_disponiveis["_sel_label"].isin(selecionadas)]
+            total_liq_sel  = df_sel["valor_liquido"].sum()
+            total_bruto_sel = df_sel["valor_bruto"].sum()
+            total_taxa_sel  = df_sel["taxa_final"].sum()
 
-            # ── 3. Conferência de valores ────────
+            # ── 3. Conferência ───────────────────
             st.markdown("#### 3. Conferência de valores")
-            val_grupo = float(grupo_row.get("valor_liquido", 0))
-            val_ofx_s = float(sel_ofx_row["valor_ofx"])
-            diff_val  = abs(val_ofx_s) - val_grupo
-            diff_pct  = (diff_val / val_grupo * 100) if val_grupo else 0
+            diff_val = abs(val_ofx_s) - total_liq_sel
+            diff_pct = (diff_val / abs(val_ofx_s) * 100) if val_ofx_s else 0
 
-            m1, m2, m3 = st.columns(3)
-            m1.metric("Valor OFX",               f"R$ {abs(val_ofx_s):,.2f}")
-            m2.metric("Valor Líq. Intermediadora", f"R$ {val_grupo:,.2f}")
-            m3.metric("Diferença",               f"R$ {diff_val:,.2f}",
-                      delta=f"{diff_pct:.2f}%",
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("Valor OFX",         f"R$ {abs(val_ofx_s):,.2f}")
+            m2.metric("Selecionado Bruto",  f"R$ {total_bruto_sel:,.2f}")
+            m3.metric("Selecionado Líq.",   f"R$ {total_liq_sel:,.2f}",
+                      help="Deve ser igual ou próximo ao Valor OFX")
+            m4.metric("Diferença",          f"R$ {diff_val:,.2f}",
+                      delta=f"{diff_pct:.2f}%" if selecionadas else None,
                       delta_color="off" if abs(diff_val) < 0.01 else "inverse")
 
             obs = st.text_input("Observação (opcional):", key="obs_manual",
-                                 placeholder="Ex: diferença por ajuste de taxa no feriado")
+                                placeholder="Ex: transações do dia 04/01 referentes ao OFX de 06/01")
 
-            # Bloqueia se diferença > 10%
-            diff_bloqueio = abs(diff_pct) > 10
-            if diff_bloqueio:
+            # Validações
+            nenhuma_sel   = len(selecionadas) == 0
+            diff_bloqueio = abs(diff_pct) > 10 and not nenhuma_sel
+
+            if nenhuma_sel:
+                st.info("Selecione ao menos uma transação para confirmar o vínculo.")
+            elif diff_bloqueio:
                 st.error(f"⛔ Diferença de {diff_pct:.1f}% acima de 10%. "
-                          "Revise se este é o lançamento correto antes de confirmar.")
+                          "Revise as transações selecionadas.")
+            elif abs(diff_val) > 0.01:
+                st.warning(f"⚠️ Diferença de R$ {diff_val:,.2f} ({diff_pct:.2f}%). "
+                            "O vínculo será marcado como divergente.")
 
             col_btn, _ = st.columns([1, 3])
             with col_btn:
                 confirmar = st.button(
                     "✅ Confirmar Vínculo", type="primary",
-                    use_container_width=True, disabled=diff_bloqueio
+                    use_container_width=True,
+                    disabled=(nenhuma_sel or diff_bloqueio)
                 )
 
             if confirmar:
+                # Cria um grupo virtual com as transações selecionadas
+                idx_virtual = f"manual_{len(st.session_state['vinculos_manuais'])}"
                 status_manual = "🔗 Vinculado Manualmente" if abs(diff_val) < 0.01 else "🔗 Vinculado c/ Divergência"
-                st.session_state["vinculos_manuais"][int(sel_idx_grupo)] = {
-                    "status":     status_manual,
-                    "memo_ofx":   sel_ofx_row["memo"],
-                    "valor_ofx":  sel_ofx_row["valor_ofx"],
-                    "data_ofx":   sel_ofx_row["data"],
-                    "observacao": obs,
-                    "diff_valor": diff_val,
+
+                st.session_state["vinculos_manuais"][idx_virtual] = {
+                    "status":         status_manual,
+                    "memo_ofx":       sel_ofx_row["memo"],
+                    "valor_ofx":      sel_ofx_row["valor_ofx"],
+                    "data_ofx":       sel_ofx_row["data"],
+                    "observacao":     obs,
+                    "diff_valor":     diff_val,
+                    "idx_transacoes": list(df_sel["idx_transacao"]),
+                    "total_liq":      total_liq_sel,
+                    "total_bruto":    total_bruto_sel,
+                    "total_taxa":     total_taxa_sel,
+                    "virtual":        True,   # não corresponde a idx_grupo real
                 }
-                st.success(f"✅ Vínculo registrado com **{sel_ofx_row['memo']}**!")
+                st.success(f"✅ {len(selecionadas)} transação(ões) vinculada(s) ao OFX **{sel_ofx_row['memo']}**!")
                 st.rerun()
 
     # ── Lista de vínculos registrados ───────────
@@ -678,28 +728,28 @@ with aba_manual:
         st.markdown("#### Vínculos manuais registrados nesta sessão")
 
         registros = []
-        for ig, info in st.session_state["vinculos_manuais"].items():
-            g_rows = df_rede_grupo[df_rede_grupo["idx_grupo"] == ig]
-            if not g_rows.empty:
-                g = g_rows.iloc[0]
-                registros.append({
-                    "Status":           info["status"],
-                    "Data Rede":        str(g.get("data", "")),
-                    "Bandeira":         g.get("bandeira", ""),
-                    "Tipo":             g.get("tipo_norm", ""),
-                    "Valor Líq. Rede":  f"R$ {float(g.get('valor_liquido', 0)):,.2f}",
-                    "Memo OFX":         info.get("memo_ofx", ""),
-                    "Valor OFX":        f"R$ {abs(float(info.get('valor_ofx', 0))):,.2f}",
-                    "Diferença":        f"R$ {float(info.get('diff_valor', 0)):,.2f}",
-                    "Observação":       info.get("observacao", ""),
-                })
+        for chave, info in st.session_state["vinculos_manuais"].items():
+            qtd_trans = len(info.get("idx_transacoes", []))
+            registros.append({
+                "Status":          info["status"],
+                "Memo OFX":        info.get("memo_ofx", ""),
+                "Data OFX":        str(info.get("data_ofx", "")),
+                "Valor OFX":       f"R$ {abs(float(info.get('valor_ofx', 0))):,.2f}",
+                "Valor Líq. Sel.": f"R$ {float(info.get('total_liq', 0)):,.2f}",
+                "Diferença":       f"R$ {float(info.get('diff_valor', 0)):,.2f}",
+                "Qtd Transações":  qtd_trans,
+                "Observação":      info.get("observacao", ""),
+            })
 
         df_vinculos = pd.DataFrame(registros)
         st.dataframe(df_vinculos, use_container_width=True)
 
-        if st.button("🗑️ Limpar todos os vínculos manuais", type="secondary"):
-            st.session_state["vinculos_manuais"] = {}
-            st.rerun()
+        col_limpar, _ = st.columns([1, 3])
+        with col_limpar:
+            if st.button("🗑️ Limpar todos os vínculos manuais", type="secondary",
+                         use_container_width=True):
+                st.session_state["vinculos_manuais"] = {}
+                st.rerun()
 
 # ════════════════════════════════════════════
 # ABA 4 — OUTROS LANÇAMENTOS OFX
