@@ -795,7 +795,24 @@ with aba_manual:
             df_editor["data"] = df_editor["data"].apply(
                 lambda d: d.strftime("%d/%m/%Y") if pd.notna(d) and hasattr(d, "strftime") else str(d)
             )
-            df_editor.insert(0, "✔", False)   # coluna de seleção
+
+            # ── Controle de "selecionar todos" via session_state ──
+            chave_todos = f"sel_todos_{sel_ofx_label}"
+            if chave_todos not in st.session_state:
+                st.session_state[chave_todos] = False
+
+            # Botões acima da tabela
+            btn_col1, btn_col2, _ = st.columns([1, 1, 4])
+            with btn_col1:
+                if st.button("☑️ Selecionar todos", key="btn_sel_todos", use_container_width=True):
+                    st.session_state[chave_todos] = True
+            with btn_col2:
+                if st.button("🔲 Desmarcar todos", key="btn_des_todos", use_container_width=True):
+                    st.session_state[chave_todos] = False
+
+            # Define valor inicial da coluna checkbox
+            valor_inicial = st.session_state[chave_todos]
+            df_editor.insert(0, "✔", valor_inicial)
 
             # Formata valores para exibição
             for c, col in [("valor_bruto", "Valor Bruto"), ("taxa_final", "Taxa (R$)"),
@@ -828,7 +845,7 @@ with aba_manual:
                 hide_index=True,
                 use_container_width=True,
                 key="editor_transacoes",
-                height=min(400, 45 + len(df_editor) * 35),
+                height=min(500, 45 + len(df_editor) * 35),
             )
 
             # Recupera índices das linhas marcadas
