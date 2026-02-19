@@ -437,10 +437,16 @@ if col_valor_rede == "Valor Bruto" and "valor_bruto" in df_rede_orig.columns:
 df_rede_grupo = agrupar_rede(df_rede_orig)
 df_result     = conciliar(df_ofx_rede, df_rede_grupo, tolerancia_dias, tolerancia_valor)
 
-# Lançamentos OFX REDE pendentes (não conciliados automaticamente)
+# Lançamentos OFX REDE pendentes (não conciliados automaticamente nem manualmente)
 memos_conciliados = set(
     df_result[df_result["Status"].str.startswith(("✅", "⚠️"))]["Memo OFX"]
 )
+# Adiciona memos já vinculados manualmente
+memos_vinculados_manual = set(
+    info.get("memo_ofx", "") for info in st.session_state["vinculos_manuais"].values()
+)
+memos_conciliados = memos_conciliados | memos_vinculados_manual
+
 df_ofx_pendentes = df_ofx_rede[~df_ofx_rede["memo"].isin(memos_conciliados)].copy()
 
 # Grupos não conciliados automaticamente
@@ -658,6 +664,8 @@ with aba_manual:
             cols_tabela = [c for c in cols_tabela if c in df_trans_disponiveis.columns]
 
             df_editor = df_trans_disponiveis[cols_tabela].copy()
+            # Converte data para string para evitar exibição como timestamp no data_editor
+            df_editor["data"] = df_editor["data"].apply(lambda d: d.strftime("%d/%m/%Y") if pd.notna(d) and hasattr(d, "strftime") else str(d))
             df_editor.insert(0, "✔", False)   # coluna de seleção
 
             # Formata valores para exibição
