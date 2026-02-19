@@ -1010,8 +1010,12 @@ with st.spinner("Processando arquivos..."):
     try:
         ofx_bytes   = file_ofx.read()
         acctid_ofx  = acctid_do_ofx(ofx_bytes)
+        # Lookup feito aqui — df_estab já está carregado neste ponto
         estab_ofx   = lookup_estab(df_estab, acctid_ofx, "ACCTID") if acctid_ofx else ""
         df_ofx_raw  = parse_ofx(ofx_bytes)
+        # Se df_estab ainda não foi carregado, tenta novamente após parse
+        if not estab_ofx and acctid_ofx and not df_estab.empty:
+            estab_ofx = lookup_estab(df_estab, acctid_ofx, "ACCTID")
         if df_ofx_raw.empty:
             st.error("Nenhuma transação encontrada no OFX."); st.stop()
     except Exception as e:
@@ -1021,15 +1025,29 @@ with st.spinner("Processando arquivos..."):
         df_rede_orig = parse_intermediadora_xls(file_rede)
         if df_rede_orig.empty:
             st.error("Nenhuma transação encontrada no arquivo da intermediadora."); st.stop()
-        # Identifica estabelecimento da intermediadora pelo campo ESTABELECIMENTO
-        estab_rede = ""
-        if "estabelecimento" in df_rede_orig.columns and not df_estab.empty:
-            estab_vals = df_rede_orig["estabelecimento"].dropna().unique()
-            for ev in estab_vals:
+        # Identifica estabelecimento:
+        # 1. Usa ACCTID do OFX → busca na lista → obtém código ESTABELECIMENTO
+        # 2. Filtra df_rede_orig para só esse estabelecimento
+        estab_rede  = ""
+        cod_estab_filtro = ""
+        if not df_estab.empty and acctid_ofx:
+            row_e = df_estab[df_estab["ACCTID"].apply(lambda v: str(int(float(str(v)))).strip() if str(v) not in ("","nan") else "") == acctid_ofx]
+            if not row_e.empty:
+                estab_rede       = row_e.iloc[0]["Fantasia"]
+                cod_estab_filtro = str(row_e.iloc[0]["ESTABELECIMENTO"]).strip()
+        # Fallback: pega o primeiro da Rede que bater com a lista
+        if not estab_rede and "estabelecimento" in df_rede_orig.columns and not df_estab.empty:
+            for ev in df_rede_orig["estabelecimento"].dropna().unique():
                 found = lookup_estab(df_estab, ev, "ESTABELECIMENTO")
                 if found:
                     estab_rede = found
+                    cod_estab_filtro = str(ev).strip()
                     break
+        # Filtra df_rede_orig pelo estabelecimento identificado
+        if cod_estab_filtro and "estabelecimento" in df_rede_orig.columns:
+            mask_e = df_rede_orig["estabelecimento"].str.strip() == cod_estab_filtro
+            if mask_e.sum() > 0:
+                df_rede_orig = df_rede_orig[mask_e].copy()
     except Exception as e:
         st.error(f"Erro ao ler arquivo da intermediadora: {e}"); st.stop()
 
@@ -1104,12 +1122,25 @@ cv4.metric("📊 Diferença OFX × Líquido",
 st.divider()
 
 # Banner de estabelecimento
-if estab_ofx or estab_rede:
-    label = estab_ofx or estab_rede
-    match = "✅" if estab_ofx and estab_rede and estab_ofx == estab_rede else ("⚠️" if estab_ofx != estab_rede and estab_ofx and estab_rede else "")
+if estab_ofx and estab_rede:
+    match = "✅" if estab_ofx == estab_rede else "⚠️"
+    label = estab_ofx
     _estab_placeholder.info(f"🏪 Estabelecimento: **{label}** {match}  |  ACCTID OFX: `{acctid_ofx}`")
+elif estab_ofx:
+    _estab_placeholder.info(f"🏪 Estabelecimento: **{estab_ofx}** (via OFX)  |  ACCTID OFX: `{acctid_ofx}`")
+elif estab_rede:
+    if acctid_ofx:
+        # ACCTID lido mas não encontrado na lista — provavelmente lista não importada ainda
+        _estab_placeholder.warning(
+            f"⚠️ ACCTID `{acctid_ofx}` não encontrado na lista de estabelecimentos.  "
+            f"Intermediadora identificou: **{estab_rede}** — importe a Lista de Estabelecimentos para cruzar."
+        )
+    else:
+        _estab_placeholder.info(f"🏪 Estabelecimento: **{estab_rede}** (via intermediadora)")
 elif acctid_ofx:
-    _estab_placeholder.warning(f"⚠️ ACCTID `{acctid_ofx}` não encontrado na lista de estabelecimentos.")
+    _estab_placeholder.warning(
+        f"⚠️ ACCTID `{acctid_ofx}` encontrado no OFX mas lista de estabelecimentos não importada."
+    )
 
 # ─────────────────────────────────────────────
 # ABAS PRINCIPAIS
