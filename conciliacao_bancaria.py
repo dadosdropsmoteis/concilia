@@ -652,24 +652,53 @@ with aba_manual:
         if df_trans_disponiveis.empty:
             st.warning("Não há transações disponíveis para vinculação.")
         else:
-            # Monta tabela com checkboxes por transação
-            df_trans_disponiveis["_sel_label"] = df_trans_disponiveis.apply(
-                lambda r: (f"{r['data']}  |  {r['bandeira']} {r['tipo_norm']}  |  "
-                           f"C.V.: {r['cv']}  |  Líq: R$ {r['valor_liquido']:,.2f}"), axis=1
+            # ── Tabela com checkbox (data_editor) ──
+            cols_tabela = ["data", "bandeira", "tipo_norm", "cv",
+                           "valor_bruto", "taxa_final", "valor_liquido"]
+            cols_tabela = [c for c in cols_tabela if c in df_trans_disponiveis.columns]
+
+            df_editor = df_trans_disponiveis[cols_tabela].copy()
+            df_editor.insert(0, "✔", False)   # coluna de seleção
+
+            # Formata valores para exibição
+            for c, col in [("valor_bruto", "Valor Bruto"), ("taxa_final", "Taxa (R$)"),
+                           ("valor_liquido", "Valor Líquido")]:
+                if c in df_editor.columns:
+                    df_editor[col] = df_editor[c].apply(lambda v: f"R$ {v:,.2f}")
+                    df_editor = df_editor.drop(columns=[c])
+
+            df_editor = df_editor.rename(columns={
+                "data": "Data", "bandeira": "Bandeira",
+                "tipo_norm": "Tipo", "cv": "C.V.",
+            })
+
+            edited = st.data_editor(
+                df_editor,
+                column_config={
+                    "✔": st.column_config.CheckboxColumn("✔", help="Marque para incluir", width="small"),
+                    "Data":          st.column_config.TextColumn("Data",       width="small"),
+                    "Bandeira":      st.column_config.TextColumn("Bandeira",   width="small"),
+                    "Tipo":          st.column_config.TextColumn("Tipo",       width="small"),
+                    "C.V.":          st.column_config.TextColumn("C.V.",       width="medium"),
+                    "Valor Bruto":   st.column_config.TextColumn("Valor Bruto",  width="medium"),
+                    "Taxa (R$)":     st.column_config.TextColumn("Taxa (R$)",    width="small"),
+                    "Valor Líquido": st.column_config.TextColumn("Valor Líquido", width="medium"),
+                },
+                disabled=["Data", "Bandeira", "Tipo", "C.V.",
+                          "Valor Bruto", "Taxa (R$)", "Valor Líquido"],
+                hide_index=True,
+                use_container_width=True,
+                key="editor_transacoes",
+                height=min(400, 45 + len(df_editor) * 35),
             )
 
-            selecionadas = st.multiselect(
-                "Transações a vincular:",
-                options=df_trans_disponiveis["_sel_label"].tolist(),
-                key="sel_transacoes",
-                help="Selecione as transações cujo total líquido corresponde ao valor OFX"
-            )
-
-            # Calcula total selecionado
-            df_sel = df_trans_disponiveis[df_trans_disponiveis["_sel_label"].isin(selecionadas)]
-            total_liq_sel  = df_sel["valor_liquido"].sum()
+            # Recupera índices das linhas marcadas
+            idx_marcados = edited[edited["✔"]].index.tolist()
+            df_sel = df_trans_disponiveis.iloc[idx_marcados]
+            total_liq_sel   = df_sel["valor_liquido"].sum()
             total_bruto_sel = df_sel["valor_bruto"].sum()
             total_taxa_sel  = df_sel["taxa_final"].sum()
+            selecionadas    = idx_marcados   # usado apenas para len()
 
             # ── 3. Conferência ───────────────────
             st.markdown("#### 3. Conferência de valores")
