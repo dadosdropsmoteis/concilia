@@ -1268,35 +1268,50 @@ with aba_caixa:
         status_cred = status_conc_por_caixa(df_conc_caixa, "CREDITO")
         status_deb  = status_conc_por_caixa(df_conc_caixa, "DEBITO")
 
-        # Monta pivot de exibição com status embutido nas colunas CREDITO e DEBITO
-        resumo_pivot_disp = resumo_pivot_num.copy()
-        resumo_pivot_disp = resumo_pivot_disp.reset_index()
+        # Monta pivot de exibição — status em colunas separadas (garantem renderização do emoji)
+        resumo_pivot_disp = resumo_pivot_num.copy().reset_index()
 
-        def formatar_com_status(row, col, status_dict):
-            val = row.get(col, 0)
-            if val == 0:
-                return "R$ 0,00"
-            emoji = status_dict.get(row["Caixa"], "")
-            return f"R$ {val:,.2f} {emoji}"
-
+        # Formata valores monetários
         for c in resumo_pivot_disp.columns:
-            if c == "Caixa":
-                continue
-            elif c == "CREDITO":
-                resumo_pivot_disp[c] = resumo_pivot_disp.apply(
-                    lambda r: formatar_com_status(r, c, status_cred), axis=1)
-            elif c == "DEBITO":
-                resumo_pivot_disp[c] = resumo_pivot_disp.apply(
-                    lambda r: formatar_com_status(r, c, status_deb), axis=1)
-            else:
-                resumo_pivot_disp[c] = resumo_pivot_disp[c].apply(
-                    lambda v: f"R$ {v:,.2f}" if isinstance(v, (int, float)) else v)
+            if c == "Caixa": continue
+            resumo_pivot_disp[c] = resumo_pivot_disp[c].apply(
+                lambda v: f"R$ {v:,.2f}" if isinstance(v, (int, float)) else v)
+
+        # Injeta colunas de status logo após CREDITO e DEBITO
+        def inserir_apos(df, col_ref, nova_col, valores):
+            """Insere nova_col imediatamente após col_ref."""
+            if col_ref not in df.columns:
+                return df
+            pos = df.columns.get_loc(col_ref) + 1
+            df.insert(pos, nova_col, valores)
+            return df
+
+        label_cred = resumo_pivot_disp["Caixa"].map(
+            lambda cx: status_cred.get(cx, "—") if cx in status_cred else "—")
+        label_deb  = resumo_pivot_disp["Caixa"].map(
+            lambda cx: status_deb.get(cx, "—") if cx in status_deb else "—")
+
+        if "CREDITO" in resumo_pivot_disp.columns:
+            resumo_pivot_disp = inserir_apos(resumo_pivot_disp, "CREDITO", "Conc. Créd.", label_cred)
+        if "DEBITO" in resumo_pivot_disp.columns:
+            resumo_pivot_disp = inserir_apos(resumo_pivot_disp, "DEBITO", "Conc. Déb.", label_deb)
 
         resumo_pivot_disp = resumo_pivot_disp.rename(columns={"Caixa": "Nº Caixa"})
-        st.dataframe(resumo_pivot_disp, use_container_width=True)
+
+        # Monta column_config explícito para forçar TextColumn em todas as colunas
+        col_cfg = {}
+        for c in resumo_pivot_disp.columns:
+            if c in ("Conc. Créd.", "Conc. Déb."):
+                col_cfg[c] = st.column_config.TextColumn(c, width="small",
+                                help="✅ Conciliado  ⚠️ Com divergência  ❌ Não encontrado")
+            else:
+                col_cfg[c] = st.column_config.TextColumn(c)
+
+        st.dataframe(resumo_pivot_disp, use_container_width=True,
+                     column_config=col_cfg, hide_index=True)
 
         # Legenda dos status de conciliação
-        st.caption("✅ Totalmente conciliado  |  ⚠️ Conciliado com divergência de valor/chave  |  ❌ Itens não encontrados na intermediadora")
+        st.caption("✅ Totalmente conciliado  |  ⚠️ Com divergência de valor/chave  |  ❌ Itens não encontrados na intermediadora  |  — Sem transações de cartão")
 
         # Totais gerais
         tc1, tc2, tc3 = st.columns(3)
