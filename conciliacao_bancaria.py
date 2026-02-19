@@ -1229,23 +1229,74 @@ with aba_caixa:
 
         st.divider()
 
+        # ── Conciliação Caixa × Rede (executa primeiro para enriquecer o resumo) ──
+        df_rede_para_caixa = df_rede_orig.copy()
+        if "estabelecimento" in df_rede_para_caixa.columns and not df_estab.empty and estab_caixa:
+            row_estab = df_estab[df_estab["Fantasia"].str.upper() == estab_caixa.upper()]
+            if not row_estab.empty:
+                cod_estab = str(row_estab.iloc[0]["ESTABELECIMENTO"])
+                mask_estab = df_rede_para_caixa["estabelecimento"].astype(str).str.strip() == cod_estab
+                df_rede_para_caixa = df_rede_para_caixa[mask_estab]
+
+        with st.spinner("Conciliando caixa com intermediadora..."):
+            df_conc_caixa = conciliar_caixa_rede(df_caixa, df_rede_para_caixa)
+
         # ── Resumo por caixa ───────────────────
         st.markdown("#### Resumo por Caixa e Forma de Pagamento")
-        resumo_caixa = df_caixa.groupby(["Caixa", "forma_norm"]).agg(
-            Qtd=("valor", "count"),
-            Total=("valor", "sum")
-        ).reset_index()
-        resumo_caixa["Total"] = resumo_caixa["Total"].apply(lambda v: f"R$ {v:,.2f}")
-        resumo_caixa = resumo_caixa.rename(columns={"forma_norm": "Forma", "Caixa": "Nº Caixa"})
 
-        # Pivot para visualização mais clara
-        resumo_pivot = df_caixa.groupby(["Caixa", "forma_norm"])["valor"].sum().unstack(fill_value=0)
-        resumo_pivot.columns.name = None
-        resumo_pivot["TOTAL"] = resumo_pivot.sum(axis=1)
-        for c in resumo_pivot.columns:
-            resumo_pivot[c] = resumo_pivot[c].apply(lambda v: f"R$ {v:,.2f}")
-        resumo_pivot = resumo_pivot.reset_index().rename(columns={"Caixa": "Nº Caixa"})
-        st.dataframe(resumo_pivot, use_container_width=True)
+        # Pivot base com valores numéricos por caixa × forma
+        resumo_pivot_num = df_caixa.groupby(["Caixa", "forma_norm"])["valor"].sum().unstack(fill_value=0)
+        resumo_pivot_num.columns.name = None
+        resumo_pivot_num["TOTAL"] = resumo_pivot_num.sum(axis=1)
+
+        # Calcula status de conciliação por caixa para CREDITO e DEBITO
+        # Para cada caixa: se todos conciliados → ✅, se algum divergente → ⚠️, se algum não encontrado → ❌
+        def status_conc_por_caixa(df_conc: pd.DataFrame, forma: str) -> dict:
+            """Retorna dict {caixa: emoji_status} para uma forma de pagamento."""
+            resultado = {}
+            sub = df_conc[df_conc["Forma"] == forma].copy()
+            for caixa, grp in sub.groupby("Caixa"):
+                statuses = grp["Status"].tolist()
+                if any("❌" in s for s in statuses):
+                    resultado[caixa] = "❌"
+                elif any("⚠️" in s for s in statuses):
+                    resultado[caixa] = "⚠️"
+                else:
+                    resultado[caixa] = "✅"
+            return resultado
+
+        status_cred = status_conc_por_caixa(df_conc_caixa, "CREDITO")
+        status_deb  = status_conc_por_caixa(df_conc_caixa, "DEBITO")
+
+        # Monta pivot de exibição com status embutido nas colunas CREDITO e DEBITO
+        resumo_pivot_disp = resumo_pivot_num.copy()
+        resumo_pivot_disp = resumo_pivot_disp.reset_index()
+
+        def formatar_com_status(row, col, status_dict):
+            val = row.get(col, 0)
+            if val == 0:
+                return "R$ 0,00"
+            emoji = status_dict.get(row["Caixa"], "")
+            return f"R$ {val:,.2f} {emoji}"
+
+        for c in resumo_pivot_disp.columns:
+            if c == "Caixa":
+                continue
+            elif c == "CREDITO":
+                resumo_pivot_disp[c] = resumo_pivot_disp.apply(
+                    lambda r: formatar_com_status(r, c, status_cred), axis=1)
+            elif c == "DEBITO":
+                resumo_pivot_disp[c] = resumo_pivot_disp.apply(
+                    lambda r: formatar_com_status(r, c, status_deb), axis=1)
+            else:
+                resumo_pivot_disp[c] = resumo_pivot_disp[c].apply(
+                    lambda v: f"R$ {v:,.2f}" if isinstance(v, (int, float)) else v)
+
+        resumo_pivot_disp = resumo_pivot_disp.rename(columns={"Caixa": "Nº Caixa"})
+        st.dataframe(resumo_pivot_disp, use_container_width=True)
+
+        # Legenda dos status de conciliação
+        st.caption("✅ Totalmente conciliado  |  ⚠️ Conciliado com divergência de valor/chave  |  ❌ Itens não encontrados na intermediadora")
 
         # Totais gerais
         tc1, tc2, tc3 = st.columns(3)
@@ -1258,22 +1309,8 @@ with aba_caixa:
 
         st.divider()
 
-        # ── Conciliação Caixa × Rede ───────────
+        # ── Conciliação Cartões — detalhes ─────
         st.markdown("#### Conciliação Cartões — Caixa × Intermediadora")
-
-        # Usa somente transações de cartão da Rede do estabelecimento atual
-        # (se há campo estabelecimento, filtra pelo estab identificado)
-        df_rede_para_caixa = df_rede_orig.copy()
-        if "estabelecimento" in df_rede_para_caixa.columns and not df_estab.empty and estab_caixa:
-            # Busca o código ESTABELECIMENTO na lista
-            row_estab = df_estab[df_estab["Fantasia"].str.upper() == estab_caixa.upper()]
-            if not row_estab.empty:
-                cod_estab = str(row_estab.iloc[0]["ESTABELECIMENTO"])
-                mask_estab = df_rede_para_caixa["estabelecimento"].astype(str).str.strip() == cod_estab
-                df_rede_para_caixa = df_rede_para_caixa[mask_estab]
-
-        with st.spinner("Conciliando caixa com intermediadora..."):
-            df_conc_caixa = conciliar_caixa_rede(df_caixa, df_rede_para_caixa)
 
         # KPIs da conciliação
         n_ok   = df_conc_caixa["Status"].str.startswith("✅").sum()
