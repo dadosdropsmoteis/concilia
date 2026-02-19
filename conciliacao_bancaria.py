@@ -21,6 +21,9 @@ st.set_page_config(
 st.title("🏦 Conciliação Bancária")
 st.caption("OFX (Extrato Banco) × XLS (Intermediadora / Rede)")
 
+# Banner de estabelecimento — exibido após o carregamento
+_estab_placeholder = st.empty()
+
 # ─────────────────────────────────────────────
 # FUNÇÕES DE PARSE
 # ─────────────────────────────────────────────
@@ -66,23 +69,36 @@ def detectar_bandeira_tipo(memo: str):
     Sufixos reconhecidos:
       CD / AT → CREDITO  (AT = antecipação de crédito)
       DB      → DEBITO
+    MAST é alias de MASTERCARD nos memos da Rede.
     """
     memo_upper = memo.upper()
-    bandeiras = ["VISA", "MASTERCARD", "MASTER", "ELO", "AMEX",
-                 "AMERICAN EXPRESS", "HIPERCARD", "HIPER", "CABAL", "DINERS"]
-
-    bandeira, tipo = "OUTROS", "OUTROS"
-    for b in bandeiras:
-        if b in memo_upper:
-            bandeira = "MASTERCARD" if b == "MASTER" else b
-            bandeira = "AMEX"       if b == "AMERICAN EXPRESS" else bandeira
-            bandeira = "HIPERCARD"  if b == "HIPER" else bandeira
+    bandeiras_map = [
+        ("AMERICAN EXPRESS", "AMEX"),
+        ("MASTERCARD",       "MASTERCARD"),
+        ("MASTER",           "MASTERCARD"),
+        ("MAST",             "MASTERCARD"),
+        ("HIPERCARD",        "HIPERCARD"),
+        ("HIPER",            "HIPERCARD"),
+        ("VISA",             "VISA"),
+        ("ELO",              "ELO"),
+        ("AMEX",             "AMEX"),
+        ("CABAL",            "CABAL"),
+        ("DINERS",           "DINERS"),
+    ]
+    bandeira = "OUTROS"
+    for token, nome in bandeiras_map:
+        if token in memo_upper:
+            bandeira = nome
             break
 
-    # Sufixos do memo OFX (ex: "REDE VISA DB0091440335", "REDE VISA AT0091440335")
-    if re.search(r"\bDB\b|\bDEBITO\b|\bDÉBITO\b|\bDEBIT\b", memo_upper):
+    tipo = "OUTROS"
+    if re.search(r"(?<![A-Z])DB(?=\d|$|\s)", memo_upper):
         tipo = "DEBITO"
-    elif re.search(r"\bCD\b|\bAT\b|\bCREDITO\b|\bCRÉDITO\b|\bCREDIT\b", memo_upper):
+    elif re.search(r"(?<![A-Z])CD(?=\d|$|\s)|(?<![A-Z])AT(?=\d|$|\s)", memo_upper):
+        tipo = "CREDITO"
+    elif re.search(r"\bDEBITO\b|\bDÉBITO\b|\bDEBIT\b", memo_upper):
+        tipo = "DEBITO"
+    elif re.search(r"\bCREDITO\b|\bCRÉDITO\b|\bCREDIT\b", memo_upper):
         tipo = "CREDITO"
 
     return bandeira, tipo
@@ -409,12 +425,182 @@ def exportar_excel(df_result: pd.DataFrame,
 
 
 # ─────────────────────────────────────────────
+# FUNÇÕES — ESTABELECIMENTOS
+# ─────────────────────────────────────────────
+
+def parse_estabelecimentos(file) -> pd.DataFrame:
+    """Lê Lista_Estabelecimentos.xlsx → DataFrame com Fantasia, CNPJ, ESTABELECIMENTO, ACCTID."""
+    df = pd.read_excel(file)
+    df.columns = [c.strip() for c in df.columns]
+    df["ACCTID"] = df["ACCTID"].astype(str).str.strip()
+    df["ESTABELECIMENTO"] = df["ESTABELECIMENTO"].astype(str).str.strip()
+    return df
+
+
+def acctid_do_ofx(file_bytes: bytes) -> str:
+    """Extrai o ACCTID do bloco <ACCTID> do OFX."""
+    content = file_bytes.decode("latin-1", errors="ignore")
+    m = re.search(r"<ACCTID>(.*?)(?=<|\Z)", content, re.IGNORECASE)
+    return m.group(1).strip() if m else ""
+
+
+def nome_filial_do_arquivo(filename: str) -> str:
+    """
+    Extrai nome da filial do nome do arquivo de caixa.
+    Regra: texto após o primeiro '.' no stem, sem o prefixo 'drops_'.
+    Ex: pagamentos_listagem_2026_1.drops_brasilia.xlsx → BRASÍLIA
+    """
+    import os
+    stem = os.path.splitext(filename)[0]          # remove extensão
+    parts = stem.split(".", 1)
+    if len(parts) < 2:
+        return stem.upper()
+    filial = parts[1].lower()
+    filial = re.sub(r"^drops_", "", filial)        # remove prefixo drops_
+    filial = filial.replace("_", " ").strip().upper()
+    return filial
+
+
+# ─────────────────────────────────────────────
+# FUNÇÕES — CAIXA
+# ─────────────────────────────────────────────
+
+def parse_caixa(file) -> pd.DataFrame:
+    """Lê relatório de caixa (xlsx com header na linha 1)."""
+    df = pd.read_excel(file, header=1)
+    df.columns = [str(c).strip() for c in df.columns]
+
+    # Normaliza tipo de pagamento
+    def norm_forma(f):
+        f = str(f).strip()
+        if f in ("Crédito", "Crédito 3x"):      return "CREDITO"
+        if f in ("Cartão Debito",):              return "DEBITO"
+        if f == "PIX":                           return "PIX"
+        return f.upper()
+
+    df["forma_norm"] = df["Forma Pagamento"].apply(norm_forma)
+
+    # Normaliza bandeira
+    df["bandeira_norm"] = df["Bandeira"].astype(str).str.upper().str.strip()
+    df["bandeira_norm"] = df["bandeira_norm"].replace({
+        "MASTER": "MASTERCARD", "AMERICAN EXPRESS": "AMEX",
+        "NAN": "", "NONE": ""
+    })
+
+    # Data como datetime
+    df["data_hora"] = pd.to_datetime(df["Data Pagamento"], errors="coerce")
+    df["data"]      = df["data_hora"].dt.date
+
+    # Valor numérico
+    def to_float(v):
+        try: return float(str(v).replace(",", ".").strip())
+        except: return 0.0
+    df["valor"]     = df["Valor"].apply(to_float)
+
+    # AutExtRef como string limpa
+    df["AutExtRef"] = df["AutExtRef"].astype(str).str.strip().replace("nan", "")
+
+    return df.dropna(subset=["data_hora"]).reset_index(drop=True)
+
+
+def conciliar_caixa_rede(df_caixa: pd.DataFrame,
+                          df_rede: pd.DataFrame,
+                          tolerancia_minutos: int = 30) -> pd.DataFrame:
+    """
+    Cruza caixa (cartões) com intermediadora por AutExtRef = C.V.
+    Fallback: valor + data + bandeira + tipo dentro de tolerância de minutos.
+    """
+    from datetime import timedelta
+
+    df_cart = df_caixa[df_caixa["forma_norm"].isin(["CREDITO", "DEBITO"])].copy()
+    df_rede2 = df_rede.copy()
+    df_rede2["cv_str"] = df_rede2["cv"].astype(str).str.strip()
+
+    resultados = []
+    rede_usados = set()
+
+    for _, rc in df_cart.iterrows():
+        status = "❌ Não encontrado na Rede"
+        match_cv = ""
+        match_data = ""
+        match_val  = ""
+        match_band = ""
+
+        # 1) Tenta por C.V. (AutExtRef)
+        if rc["AutExtRef"]:
+            mask_cv = df_rede2["cv_str"] == rc["AutExtRef"]
+            cands = df_rede2[mask_cv & ~df_rede2.index.isin(rede_usados)]
+            if not cands.empty:
+                idx = cands.index[0]
+                rede_usados.add(idx)
+                r = cands.iloc[0]
+                diff_val = abs(rc["valor"] - r["valor_bruto"])
+                status   = "✅ Conciliado (C.V.)" if diff_val < 0.02 else "⚠️ C.V. ok, valor diverge"
+                match_cv   = r["cv"]
+                match_data = str(r["data"])
+                match_val  = r["valor_bruto"]
+                match_band = r["bandeira"]
+
+        # 2) Fallback: valor + data + bandeira
+        if "❌" in status:
+            for idx2, r2 in df_rede2.iterrows():
+                if idx2 in rede_usados: continue
+                if abs(rc["valor"] - r2["valor_bruto"]) > 0.02: continue
+                if rc["data"] != r2["data"]: continue
+                b_caixa = rc["bandeira_norm"]
+                b_rede  = str(r2.get("bandeira", "")).upper()
+                if b_caixa and b_rede and b_caixa != b_rede: continue
+                rede_usados.add(idx2)
+                status   = "⚠️ Conciliado (valor+data)"
+                match_cv   = r2["cv"]
+                match_data = str(r2["data"])
+                match_val  = r2["valor_bruto"]
+                match_band = r2["bandeira"]
+                break
+
+        resultados.append({
+            "Status":         status,
+            "Caixa":          rc["Caixa"],
+            "Forma":          rc["Forma Pagamento"],
+            "Bandeira Cx":    rc["bandeira_norm"],
+            "Data/Hora":      rc["data_hora"].strftime("%d/%m/%Y %H:%M") if pd.notna(rc["data_hora"]) else "",
+            "Valor Caixa":    rc["valor"],
+            "AutExtRef":      rc["AutExtRef"],
+            "C.V. Rede":      match_cv,
+            "Data Rede":      match_data,
+            "Bandeira Rede":  match_band,
+            "Valor Rede":     match_val,
+        })
+
+    # Registros da Rede sem par no caixa
+    for idx2, r2 in df_rede2.iterrows():
+        if idx2 not in rede_usados:
+            resultados.append({
+                "Status":         "❌ Não encontrado no Caixa",
+                "Caixa":          "",
+                "Forma":          r2.get("tipo_norm", ""),
+                "Bandeira Cx":    "",
+                "Data/Hora":      "",
+                "Valor Caixa":    "",
+                "AutExtRef":      "",
+                "C.V. Rede":      r2["cv"],
+                "Data Rede":      str(r2["data"]),
+                "Bandeira Rede":  r2["bandeira"],
+                "Valor Rede":     r2["valor_bruto"],
+            })
+
+    return pd.DataFrame(resultados)
+
+
+# ─────────────────────────────────────────────
 # SIDEBAR
 # ─────────────────────────────────────────────
 with st.sidebar:
     st.header("📂 Importar Arquivos")
-    file_ofx  = st.file_uploader("Extrato Bancário (.ofx)",       type=["ofx", "OFX"])
-    file_rede = st.file_uploader("Extrato Intermediadora (.xls)", type=["xls", "xlsx", "tsv", "txt"])
+    file_estab = st.file_uploader("📋 Estabelecimentos (.xlsx)", type=["xlsx"])
+    file_ofx   = st.file_uploader("Extrato Bancário (.ofx)",     type=["ofx", "OFX"])
+    file_rede  = st.file_uploader("Extrato Intermediadora (.xls)", type=["xls", "xlsx", "tsv", "txt"])
+    file_caixa = st.file_uploader("🏪 Relatório de Caixa (.xlsx)", type=["xlsx"])
 
     st.divider()
     st.header("⚙️ Parâmetros")
@@ -445,6 +631,22 @@ if "vinculos_manuais" not in st.session_state:
     st.session_state["vinculos_manuais"] = {}
 
 # ─────────────────────────────────────────────
+# ESTABELECIMENTOS
+# ─────────────────────────────────────────────
+df_estab = pd.DataFrame()
+if file_estab:
+    try:
+        df_estab = parse_estabelecimentos(file_estab)
+    except Exception as e:
+        st.sidebar.error(f"Erro ao ler estabelecimentos: {e}")
+
+def lookup_estab(df_estab, key, col):
+    """Retorna Fantasia dado um valor na coluna col."""
+    if df_estab.empty: return ""
+    row = df_estab[df_estab[col].astype(str).str.strip() == str(key).strip()]
+    return row.iloc[0]["Fantasia"] if not row.empty else ""
+
+# ─────────────────────────────────────────────
 # AGUARDA ARQUIVOS
 # ─────────────────────────────────────────────
 if not file_ofx or not file_rede:
@@ -468,7 +670,10 @@ lançamento OFX pendente. Vínculos são exportados no Excel.
 # ─────────────────────────────────────────────
 with st.spinner("Processando arquivos..."):
     try:
-        df_ofx_raw = parse_ofx(file_ofx.read())
+        ofx_bytes   = file_ofx.read()
+        acctid_ofx  = acctid_do_ofx(ofx_bytes)
+        estab_ofx   = lookup_estab(df_estab, acctid_ofx, "ACCTID") if acctid_ofx else ""
+        df_ofx_raw  = parse_ofx(ofx_bytes)
         if df_ofx_raw.empty:
             st.error("Nenhuma transação encontrada no OFX."); st.stop()
     except Exception as e:
@@ -478,6 +683,15 @@ with st.spinner("Processando arquivos..."):
         df_rede_orig = parse_intermediadora_xls(file_rede)
         if df_rede_orig.empty:
             st.error("Nenhuma transação encontrada no arquivo da intermediadora."); st.stop()
+        # Identifica estabelecimento da intermediadora pelo campo ESTABELECIMENTO
+        estab_rede = ""
+        if "estabelecimento" in df_rede_orig.columns and not df_estab.empty:
+            estab_vals = df_rede_orig["estabelecimento"].dropna().unique()
+            for ev in estab_vals:
+                found = lookup_estab(df_estab, ev, "ESTABELECIMENTO")
+                if found:
+                    estab_rede = found
+                    break
     except Exception as e:
         st.error(f"Erro ao ler arquivo da intermediadora: {e}"); st.stop()
 
@@ -551,14 +765,23 @@ cv4.metric("📊 Diferença OFX × Líquido",
 
 st.divider()
 
+# Banner de estabelecimento
+if estab_ofx or estab_rede:
+    label = estab_ofx or estab_rede
+    match = "✅" if estab_ofx and estab_rede and estab_ofx == estab_rede else ("⚠️" if estab_ofx != estab_rede and estab_ofx and estab_rede else "")
+    _estab_placeholder.info(f"🏪 Estabelecimento: **{label}** {match}  |  ACCTID OFX: `{acctid_ofx}`")
+elif acctid_ofx:
+    _estab_placeholder.warning(f"⚠️ ACCTID `{acctid_ofx}` não encontrado na lista de estabelecimentos.")
+
 # ─────────────────────────────────────────────
 # ABAS PRINCIPAIS
 # ─────────────────────────────────────────────
-aba_result, aba_detalhe, aba_manual, aba_outros = st.tabs([
+aba_result, aba_detalhe, aba_manual, aba_outros, aba_caixa = st.tabs([
     "🔍 Conciliação",
     "📋 Detalhe por Transação",
     "🔗 Vinculação Manual",
     "📄 Outros Lançamentos OFX",
+    "🏪 Caixa",
 ])
 
 # ════════════════════════════════════════════
@@ -959,6 +1182,158 @@ with aba_outros:
         st.dataframe(df_out, use_container_width=True)
         total_outros = df_ofx_outros["valor_ofx"].apply(lambda v: v if v > 0 else 0).sum()
         st.metric("Total créditos", f"R$ {total_outros:,.2f}")
+
+st.divider()
+
+# ════════════════════════════════════════════
+# ABA 5 — CAIXA
+# ════════════════════════════════════════════
+with aba_caixa:
+    st.subheader("🏪 Conciliação Caixa × Intermediadora")
+
+    if not file_caixa:
+        st.info("👈 Importe o Relatório de Caixa (.xlsx) na barra lateral para usar este módulo.")
+    else:
+        # Parse do caixa
+        try:
+            nome_arquivo_caixa = file_caixa.name
+            filial_caixa = nome_filial_do_arquivo(nome_arquivo_caixa)
+            df_caixa = parse_caixa(file_caixa)
+        except Exception as e:
+            st.error(f"Erro ao ler arquivo de caixa: {e}")
+            st.stop()
+
+        # Identifica estabelecimento do caixa pelo nome do arquivo vs lista
+        estab_caixa = ""
+        if not df_estab.empty:
+            for _, er in df_estab.iterrows():
+                if str(er["Fantasia"]).upper() == filial_caixa:
+                    estab_caixa = er["Fantasia"]
+                    break
+            if not estab_caixa:
+                estab_caixa = filial_caixa
+
+        st.info(f"🏪 Filial: **{estab_caixa}**  |  Arquivo: `{nome_arquivo_caixa}`")
+
+        # ── KPIs do caixa ──────────────────────
+        total_cx       = len(df_caixa)
+        total_cartoes  = df_caixa[df_caixa["forma_norm"].isin(["CREDITO","DEBITO"])]
+        total_pix_cx   = df_caixa[df_caixa["forma_norm"] == "PIX"]
+        outros_cx      = df_caixa[~df_caixa["forma_norm"].isin(["CREDITO","DEBITO","PIX"])]
+
+        k1, k2, k3, k4 = st.columns(4)
+        k1.metric("📋 Total lançamentos", total_cx)
+        k2.metric("💳 Cartões",  f"{len(total_cartoes)} — R$ {total_cartoes['valor'].sum():,.2f}")
+        k3.metric("🔵 PIX",      f"{len(total_pix_cx)} — R$ {total_pix_cx['valor'].sum():,.2f}")
+        k4.metric("📦 Outros",   f"{len(outros_cx)} — R$ {outros_cx['valor'].sum():,.2f}")
+
+        st.divider()
+
+        # ── Resumo por caixa ───────────────────
+        st.markdown("#### Resumo por Caixa e Forma de Pagamento")
+        resumo_caixa = df_caixa.groupby(["Caixa", "forma_norm"]).agg(
+            Qtd=("valor", "count"),
+            Total=("valor", "sum")
+        ).reset_index()
+        resumo_caixa["Total"] = resumo_caixa["Total"].apply(lambda v: f"R$ {v:,.2f}")
+        resumo_caixa = resumo_caixa.rename(columns={"forma_norm": "Forma", "Caixa": "Nº Caixa"})
+
+        # Pivot para visualização mais clara
+        resumo_pivot = df_caixa.groupby(["Caixa", "forma_norm"])["valor"].sum().unstack(fill_value=0)
+        resumo_pivot.columns.name = None
+        resumo_pivot["TOTAL"] = resumo_pivot.sum(axis=1)
+        for c in resumo_pivot.columns:
+            resumo_pivot[c] = resumo_pivot[c].apply(lambda v: f"R$ {v:,.2f}")
+        resumo_pivot = resumo_pivot.reset_index().rename(columns={"Caixa": "Nº Caixa"})
+        st.dataframe(resumo_pivot, use_container_width=True)
+
+        # Totais gerais
+        tc1, tc2, tc3 = st.columns(3)
+        tc1.metric("Total Crédito",
+                   f"R$ {df_caixa[df_caixa['forma_norm']=='CREDITO']['valor'].sum():,.2f}")
+        tc2.metric("Total Débito",
+                   f"R$ {df_caixa[df_caixa['forma_norm']=='DEBITO']['valor'].sum():,.2f}")
+        tc3.metric("Total Geral",
+                   f"R$ {df_caixa['valor'].sum():,.2f}")
+
+        st.divider()
+
+        # ── Conciliação Caixa × Rede ───────────
+        st.markdown("#### Conciliação Cartões — Caixa × Intermediadora")
+
+        # Usa somente transações de cartão da Rede do estabelecimento atual
+        # (se há campo estabelecimento, filtra pelo estab identificado)
+        df_rede_para_caixa = df_rede_orig.copy()
+        if "estabelecimento" in df_rede_para_caixa.columns and not df_estab.empty and estab_caixa:
+            # Busca o código ESTABELECIMENTO na lista
+            row_estab = df_estab[df_estab["Fantasia"].str.upper() == estab_caixa.upper()]
+            if not row_estab.empty:
+                cod_estab = str(row_estab.iloc[0]["ESTABELECIMENTO"])
+                mask_estab = df_rede_para_caixa["estabelecimento"].astype(str).str.strip() == cod_estab
+                df_rede_para_caixa = df_rede_para_caixa[mask_estab]
+
+        with st.spinner("Conciliando caixa com intermediadora..."):
+            df_conc_caixa = conciliar_caixa_rede(df_caixa, df_rede_para_caixa)
+
+        # KPIs da conciliação
+        n_ok   = df_conc_caixa["Status"].str.startswith("✅").sum()
+        n_div  = df_conc_caixa["Status"].str.startswith("⚠️").sum()
+        n_err  = df_conc_caixa["Status"].str.startswith("❌").sum()
+        tot_cc = len(df_conc_caixa)
+
+        p1, p2, p3, p4 = st.columns(4)
+        p1.metric("📋 Total comparado",  tot_cc)
+        p2.metric("✅ Conciliados",       f"{n_ok} ({n_ok/tot_cc*100:.1f}%)" if tot_cc else "0")
+        p3.metric("⚠️ Divergentes",      f"{n_div} ({n_div/tot_cc*100:.1f}%)" if tot_cc else "0")
+        p4.metric("❌ Não encontrados",   f"{n_err} ({n_err/tot_cc*100:.1f}%)" if tot_cc else "0")
+
+        # Filtro de status
+        status_cx = df_conc_caixa["Status"].unique().tolist()
+        filtro_cx = st.multiselect("Filtrar status:", status_cx, default=status_cx, key="filtro_cx")
+        df_cx_show = df_conc_caixa[df_conc_caixa["Status"].isin(filtro_cx)].copy()
+
+        # Formata valores
+        for c in ["Valor Caixa", "Valor Rede"]:
+            df_cx_show[c] = df_cx_show[c].apply(
+                lambda v: f"R$ {float(v):,.2f}" if str(v) not in ("", "nan") else ""
+            )
+
+        st.dataframe(df_cx_show, use_container_width=True, height=420)
+
+        # ── Detalhes Divergentes ───────────────
+        diverg = df_conc_caixa[df_conc_caixa["Status"].str.startswith("❌")].copy()
+        if not diverg.empty:
+            with st.expander(f"❌ Detalhes dos não encontrados ({len(diverg)} registros)"):
+                st.dataframe(diverg, use_container_width=True)
+
+        # ── Export Excel da aba Caixa ──────────
+        def exportar_caixa(df_caixa, df_conc):
+            out = io.BytesIO()
+            with pd.ExcelWriter(out, engine="xlsxwriter") as writer:
+                df_caixa.drop(columns=["data_hora","forma_norm","bandeira_norm","data"], errors="ignore").to_excel(
+                    writer, sheet_name="Caixa Completo", index=False)
+                df_conc.to_excel(writer, sheet_name="Conciliação Caixa", index=False)
+                wb   = writer.book
+                fmt_h   = wb.add_format({"bold":True,"bg_color":"#1F3864","font_color":"white","border":1})
+                fmt_ok  = wb.add_format({"bg_color":"#C6EFCE"})
+                fmt_w   = wb.add_format({"bg_color":"#FFEB9C"})
+                fmt_e   = wb.add_format({"bg_color":"#FFC7CE"})
+                ws = writer.sheets["Conciliação Caixa"]
+                for cn, col in enumerate(df_conc.columns):
+                    ws.write(0, cn, col, fmt_h); ws.set_column(cn, cn, 20)
+                for rn in range(1, len(df_conc)+1):
+                    s = str(df_conc.iloc[rn-1]["Status"])
+                    ws.set_row(rn, None, fmt_ok if "✅" in s else (fmt_w if "⚠️" in s else fmt_e))
+            return out.getvalue()
+
+        excel_cx = exportar_caixa(df_caixa, df_conc_caixa)
+        st.download_button(
+            "⬇️ Exportar Caixa (Excel)",
+            data=excel_cx,
+            file_name=f"caixa_{filial_caixa}_{datetime.today().strftime('%Y%m%d_%H%M')}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+        )
 
 st.divider()
 
