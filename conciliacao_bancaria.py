@@ -916,6 +916,188 @@ def conciliar_pix_pos_ofx(df_pix: pd.DataFrame,
 
 
 # ─────────────────────────────────────────────
+# FUNÇÕES — PIX TEF
+# ─────────────────────────────────────────────
+
+def parse_pix_tef(file) -> tuple:
+    """
+    Lê relatório PIX TEF Sicredi (.xlsx).
+    Retorna (df_transacoes, metadata).
+    Metadata: {associado, periodo_inicio, periodo_fim, total_recebimentos}
+    Colunas df: natureza, tipo, nome, data_pago, hora, valor_num, end_to_end_id, origem,
+                tipo_iniciacao, instituicao, descricao, chave, id_conciliador
+    Filtra somente CRÉDITO / RECEBIMENTO.
+    """
+    import openpyxl, io as _io
+
+    raw = file.read()
+    wb  = openpyxl.load_workbook(_io.BytesIO(raw), data_only=True)
+    ws  = wb.active
+
+    all_rows = [
+        [str(c.value).strip() if c.value is not None else "" for c in row]
+        for row in ws.iter_rows()
+    ]
+
+    meta       = {}
+    header_row = None
+    rows       = []
+
+    for i, full_row in enumerate(all_rows):
+        vals = [v for v in full_row if v not in ("", "nan", "None")]
+        if not vals:
+            continue
+        label = vals[0].lower()
+        if "associado" in label and len(vals) > 1:
+            meta["associado"] = vals[1]
+        elif "data inicio" in label or "data início" in label:
+            meta["periodo_inicio"] = vals[1] if len(vals) > 1 else ""
+        elif "data fim" in label:
+            meta["periodo_fim"] = vals[1] if len(vals) > 1 else ""
+        elif "total recebimentos" in label:
+            meta["total_recebimentos"] = vals[1] if len(vals) > 1 else ""
+        elif vals[0].lower() == "natureza da transação":
+            header_row = i
+        elif header_row is not None and i > header_row:
+            if len(full_row) >= 6 and full_row[0]:
+                rows.append(full_row)
+
+    if not rows:
+        return pd.DataFrame(), meta
+
+    COLS = ["natureza","tipo","nome","data_str","hora","valor_str",
+            "end_to_end_id","origem","tipo_iniciacao","instituicao",
+            "descricao","chave","id_conciliador"]
+    df = pd.DataFrame(rows, columns=COLS[:len(rows[0])] + [f"_x{k}" for k in range(max(0, len(rows[0])-len(COLS)))])
+
+    # Somente créditos/recebimentos
+    df = df[df["natureza"].str.upper() == "CRÉDITO"].copy()
+    df = df[df["tipo"].str.upper() == "RECEBIMENTO"].copy()
+
+    def br_float(s):
+        try:
+            return float(str(s).replace("R$","").replace(".","").replace(",",".").strip())
+        except:
+            return 0.0
+
+    def parse_data(s):
+        try:
+            return pd.to_datetime(str(s).strip()[:10], format="%d/%m/%Y").date()
+        except:
+            return None
+
+    df["valor_num"] = df["valor_str"].apply(br_float)
+    df["data_pago"] = df["data_str"].apply(parse_data)
+    df = df.dropna(subset=["data_pago"]).reset_index(drop=True)
+    df["idx_tef"]   = df.index
+    return df, meta
+
+
+def conciliar_pix_unificado(df_pos: pd.DataFrame,
+                              df_tef: pd.DataFrame,
+                              df_ofx: pd.DataFrame,
+                              tolerancia_dias: int = 2) -> tuple:
+    """
+    Concilia POS + TEF contra OFX PIX em uma passagem única.
+    Retorna (df_resultado, df_ofx_pix_usado).
+    Coluna Origem: 'POS' ou 'TEF'.
+    """
+    df_ofx_pix = df_ofx[
+        df_ofx["memo"].str.upper().str.contains("PIX", na=False) &
+        (df_ofx["valor_ofx"] > 0)
+    ].copy().reset_index(drop=True)
+    df_ofx_pix["_ofx_idx"] = df_ofx_pix.index
+
+    # Índice hash: valor → [ofx_idx]
+    val_index = {}
+    for i, r in df_ofx_pix.iterrows():
+        val_index.setdefault(round(r["valor_ofx"], 2), []).append(i)
+
+    ofx_usados = set()
+    resultado  = []
+
+    def tenta_match(valor_num, data_pago):
+        """Retorna (ofx_idx, row_ofx) ou (None, None)."""
+        for oi in val_index.get(round(valor_num, 2), []):
+            if oi in ofx_usados:
+                continue
+            ro = df_ofx_pix.iloc[oi]
+            try:
+                diff = abs((data_pago - ro["data"]).days)
+            except:
+                diff = 999
+            if diff <= tolerancia_dias:
+                return oi, ro
+        return None, None
+
+    # POS
+    if not df_pos.empty:
+        for _, rp in df_pos.iterrows():
+            oi, ro = tenta_match(rp["valor_pago_num"], rp["data_pago"])
+            if oi is not None:
+                ofx_usados.add(oi)
+                status = "✅ Conciliado"
+                md, mm, mf, mv = str(ro["data"]), ro["memo"], ro.get("fitid",""), ro["valor_ofx"]
+            else:
+                status = "❌ Não encontrado no OFX"
+                md, mm, mf, mv = "", "", "", ""
+            resultado.append({
+                "Status":       status,
+                "Origem":       "POS",
+                "Data Pago":    rp["data_pago"].strftime("%d/%m/%Y") if rp["data_pago"] else "",
+                "Identificador":rp.get("identificador",""),
+                "Pagador":      rp.get("pagador",""),
+                "Valor Pago":   rp["valor_pago_num"],
+                "Tarifa":       rp.get("tarifa_num", 0),
+                "Data OFX":     md, "Memo OFX": mm, "Valor OFX": mv, "FITID OFX": mf,
+                "_src_idx":     int(rp["idx_pix"]),
+            })
+
+    # TEF
+    if not df_tef.empty:
+        for _, rt in df_tef.iterrows():
+            oi, ro = tenta_match(rt["valor_num"], rt["data_pago"])
+            if oi is not None:
+                ofx_usados.add(oi)
+                status = "✅ Conciliado"
+                md, mm, mf, mv = str(ro["data"]), ro["memo"], ro.get("fitid",""), ro["valor_ofx"]
+            else:
+                status = "❌ Não encontrado no OFX"
+                md, mm, mf, mv = "", "", "", ""
+            resultado.append({
+                "Status":       status,
+                "Origem":       "TEF",
+                "Data Pago":    rt["data_pago"].strftime("%d/%m/%Y") if rt["data_pago"] else "",
+                "Identificador":rt.get("end_to_end_id",""),
+                "Pagador":      rt.get("nome",""),
+                "Valor Pago":   rt["valor_num"],
+                "Tarifa":       0,
+                "Data OFX":     md, "Memo OFX": mm, "Valor OFX": mv, "FITID OFX": mf,
+                "_src_idx":     int(rt["idx_tef"]),
+            })
+
+    # OFX sem par
+    for oi, ro in df_ofx_pix.iterrows():
+        if oi not in ofx_usados:
+            resultado.append({
+                "Status":       "❌ Não encontrado no POS/TEF",
+                "Origem":       "OFX",
+                "Data Pago":    "",
+                "Identificador":"",
+                "Pagador":      "",
+                "Valor Pago":   "",
+                "Tarifa":       "",
+                "Data OFX":     str(ro["data"]),
+                "Memo OFX":     ro["memo"],
+                "Valor OFX":    ro["valor_ofx"],
+                "FITID OFX":    ro.get("fitid",""),
+                "_src_idx":     -1,
+            })
+
+    return pd.DataFrame(resultado), df_ofx_pix
+
+
+# ─────────────────────────────────────────────
 # SIDEBAR
 # ─────────────────────────────────────────────
 with st.sidebar:
@@ -924,7 +1106,8 @@ with st.sidebar:
     file_ofx   = st.file_uploader("Extrato Bancário (.ofx)",     type=["ofx", "OFX"])
     file_rede  = st.file_uploader("Extrato Intermediadora (.xls)", type=["xls", "xlsx", "tsv", "txt"])
     file_caixa   = st.file_uploader("🏪 Relatório de Caixa (.xlsx)", type=["xlsx"])
-    file_pix_pos = st.file_uploader("🔵 Relatório PIX POS (.xls)",    type=["xls","xlsx"])
+    file_pix_pos = st.file_uploader("🔵 PIX POS (.xls)",  type=["xls","xlsx"])
+    file_pix_tef = st.file_uploader("🟣 PIX TEF (.xlsx)", type=["xls","xlsx"])
 
     st.divider()
     st.header("⚙️ Parâmetros")
@@ -957,6 +1140,8 @@ if "vinculos_caixa" not in st.session_state:
     st.session_state["vinculos_caixa"] = []
 if "vinculos_pix_pos" not in st.session_state:
     st.session_state["vinculos_pix_pos"] = []
+if "vinculos_pix_tef" not in st.session_state:
+    st.session_state["vinculos_pix_tef"] = []
 
 # ─────────────────────────────────────────────
 # ESTABELECIMENTOS
@@ -1151,7 +1336,7 @@ aba_result, aba_detalhe, aba_manual, aba_outros, aba_caixa, aba_pix_pos = st.tab
     "🔗 Vinculação Manual",
     "📄 Outros Lançamentos OFX",
     "🏪 Caixa",
-    "🔵 PIX POS",
+    "🔵 PIX",
 ])
 
 # ════════════════════════════════════════════
@@ -1974,274 +2159,321 @@ with aba_caixa:
 st.divider()
 
 # ════════════════════════════════════════════
-# ABA 6 — PIX POS
+# ABA 6 — PIX (POS + TEF)
 # ════════════════════════════════════════════
 with aba_pix_pos:
-    st.subheader("🔵 Conciliação PIX POS × OFX")
+    st.subheader("🔵 Conciliação PIX × OFX")
 
-    if not file_pix_pos:
-        st.info("👈 Importe o Relatório PIX POS (.xls) na barra lateral para usar este módulo.")
+    tem_pos = bool(file_pix_pos)
+    tem_tef = bool(file_pix_tef)
+
+    if not tem_pos and not tem_tef:
+        st.info("👈 Importe ao menos um arquivo PIX (POS ou TEF) na barra lateral.")
     else:
-        try:
-            df_pix_pos, meta_pix = parse_pix_pos(file_pix_pos)
-        except Exception as e:
-            st.error(f"Erro ao ler arquivo PIX POS: {e}")
-            st.stop()
+        df_pix_pos_data = pd.DataFrame()
+        df_pix_tef_data = pd.DataFrame()
+        meta_pos = {}
+        meta_tef = {}
 
-        if df_pix_pos.empty:
-            st.warning("Nenhuma transação encontrada no arquivo PIX POS.")
+        # ── Parse POS ──
+        if tem_pos:
+            try:
+                df_pix_pos_data, meta_pos = parse_pix_pos(file_pix_pos)
+            except Exception as e:
+                st.error(f"Erro ao ler PIX POS: {e}")
+
+        # ── Parse TEF ──
+        if tem_tef:
+            try:
+                df_pix_tef_data, meta_tef = parse_pix_tef(file_pix_tef)
+            except Exception as e:
+                st.error(f"Erro ao ler PIX TEF: {e}")
+
+        # ── Metadata / info ──
+        info_cols = st.columns(2)
+        if tem_pos and meta_pos:
+            acctid_pix = meta_pos.get("acctid","") or acctid_do_nome_arquivo_pix(file_pix_pos.name)
+            with info_cols[0]:
+                st.info(f"**POS** — {meta_pos.get('nome','—')}  |  "
+                        f"Ag: {meta_pos.get('agencia','—')} Cc: {meta_pos.get('conta','—')}  |  "
+                        + (f"Período: {meta_pos.get('periodo','')}" if meta_pos.get('periodo') else ""))
+        if tem_tef and meta_tef:
+            with info_cols[1]:
+                st.info(f"**TEF** — {meta_tef.get('associado','—')}  |  "
+                        f"Período: {meta_tef.get('periodo_inicio','')} → {meta_tef.get('periodo_fim','')}")
+
+        # ── KPIs ──
+        n_pos    = len(df_pix_pos_data)
+        n_tef    = len(df_pix_tef_data)
+        val_pos  = df_pix_pos_data["valor_pago_num"].sum() if n_pos else 0
+        val_tef  = df_pix_tef_data["valor_num"].sum()      if n_tef else 0
+        tar_pos  = df_pix_pos_data["tarifa_num"].sum()      if n_pos else 0
+
+        k1, k2, k3, k4 = st.columns(4)
+        k1.metric("📟 POS — Transações",  n_pos)
+        k2.metric("📱 TEF — Transações",  n_tef)
+        k3.metric("💰 Valor Total POS",   f"R$ {val_pos:,.2f}")
+        k4.metric("💰 Valor Total TEF",   f"R$ {val_tef:,.2f}")
+
+        st.divider()
+
+        # ── Conciliação unificada ──
+        with st.spinner("Conciliando PIX com OFX..."):
+            df_conc_pix, df_ofx_pix_usado = conciliar_pix_unificado(
+                df_pix_pos_data, df_pix_tef_data, df_ofx_raw, tolerancia_dias=2
+            )
+
+        df_conc_pix = df_conc_pix.reset_index(drop=True)
+        df_conc_pix["_idx"] = df_conc_pix.index
+
+        # Aplica vínculos manuais (POS e TEF juntos)
+        for vinc in st.session_state["vinculos_pix_pos"] + st.session_state["vinculos_pix_tef"]:
+            for i in vinc.get("idx_pos", []) + vinc.get("idx_ofx", []):
+                if i < len(df_conc_pix):
+                    df_conc_pix.at[i, "Status"] = "🔗 Vinculado Manualmente"
+
+        # Atualiza status PIX geral no session_state (para pivot do Caixa)
+        _n_err = df_conc_pix["Status"].str.startswith("❌").sum()
+        _n_man = df_conc_pix["Status"].str.startswith("🔗").sum()
+        _n_ok  = df_conc_pix["Status"].str.startswith("✅").sum()
+        _tot   = len(df_conc_pix)
+        if _n_err > 0:    _spg = "❌"
+        elif _n_man > 0:  _spg = "🔗"
+        elif _n_ok  > 0:  _spg = "✅"
+        else:             _spg = "—"
+        st.session_state["_status_pix_geral"] = _spg
+
+        # ── KPIs conciliação ──
+        st.markdown("#### Resultado da Conciliação")
+        p1, p2, p3, p4 = st.columns(4)
+        p1.metric("📋 Total",           _tot)
+        p2.metric("✅ Conciliados",      f"{_n_ok} ({_n_ok/_tot*100:.1f}%)" if _tot else "0")
+        p3.metric("🔗 Vinc. Manual",     _n_man)
+        p4.metric("❌ Não encontrados",  f"{_n_err} ({_n_err/_tot*100:.1f}%)" if _tot else "0")
+
+        # ── Filtros ──
+        fc1, fc2 = st.columns(2)
+        with fc1:
+            status_opts = sorted(df_conc_pix["Status"].unique().tolist())
+            filtro_status = st.multiselect("Status:", status_opts, default=status_opts, key="filtro_pix_status")
+        with fc2:
+            origem_opts = sorted(df_conc_pix["Origem"].unique().tolist())
+            filtro_origem = st.multiselect("Origem:", origem_opts, default=origem_opts, key="filtro_pix_origem")
+
+        df_pix_show = df_conc_pix[
+            df_conc_pix["Status"].isin(filtro_status) &
+            df_conc_pix["Origem"].isin(filtro_origem)
+        ].copy()
+
+        # ── Tabela unificada ──
+        df_pix_disp = df_pix_show.drop(columns=["_idx","_src_idx"], errors="ignore").copy()
+        for c in ["Valor Pago","Tarifa","Valor OFX"]:
+            df_pix_disp[c] = df_pix_disp[c].apply(
+                lambda v: f"R$ {float(v):,.2f}" if str(v) not in ("","nan") else "")
+
+        col_cfg_pix = {
+            "Status":       st.column_config.TextColumn("Status",        width="medium"),
+            "Origem":       st.column_config.TextColumn("Origem",        width="small"),
+            "Data Pago":    st.column_config.TextColumn("Data Pago",     width="small"),
+            "Identificador":st.column_config.TextColumn("ID/EndToEnd",   width="large"),
+            "Pagador":      st.column_config.TextColumn("Pagador",       width="medium"),
+            "Valor Pago":   st.column_config.TextColumn("Valor Pago",    width="medium"),
+            "Tarifa":       st.column_config.TextColumn("Tarifa",        width="small"),
+            "Data OFX":     st.column_config.TextColumn("Data OFX",      width="small"),
+            "Memo OFX":     st.column_config.TextColumn("Memo OFX",      width="medium"),
+            "Valor OFX":    st.column_config.TextColumn("Valor OFX",     width="medium"),
+            "FITID OFX":    st.column_config.TextColumn("FITID OFX",     width="medium"),
+        }
+        st.dataframe(df_pix_disp, use_container_width=True, hide_index=True,
+                     column_config=col_cfg_pix, height=420)
+
+        st.divider()
+
+        # ── Vinculação Manual ──
+        st.markdown("#### 🔗 Vinculação Manual")
+
+        mask_pend = (
+            ~df_conc_pix["Status"].str.startswith("✅") &
+            ~df_conc_pix["Status"].str.startswith("🔗")
+        )
+        df_pend = df_conc_pix[mask_pend].copy()
+
+        if df_pend.empty:
+            st.success("Todos os registros estão conciliados ou vinculados.")
         else:
-            # Identifica estabelecimento pelo ACCTID do arquivo
-            acctid_pix = meta_pix.get("acctid", "") or acctid_do_nome_arquivo_pix(file_pix_pos.name)
-            estab_pix  = lookup_estab(df_estab, acctid_pix, "ACCTID") if acctid_pix else ""
+            st.info(f"{len(df_pend)} registro(s) pendente(s).")
 
-            st.info(
-                f"🏦 **{meta_pix.get('nome','—')}**  |  "
-                f"Ag: {meta_pix.get('agencia','—')} / Cc: {meta_pix.get('conta','—')}  |  "
-                f"ACCTID: `{acctid_pix}`"
-                + (f"  |  Estabelecimento: **{estab_pix}**" if estab_pix else "  |  ⚠️ Estabelecimento não encontrado na lista")
-            )
-            if meta_pix.get("periodo"):
-                st.caption(f"📅 Período: {meta_pix['periodo']}")
+            df_pend_pix = df_pend[df_pend["Origem"].isin(["POS","TEF"])].copy()
+            df_pend_ofx = df_pend[df_pend["Origem"] == "OFX"].copy()
 
-            # ── KPIs ──────────────────────────────
-            total_pix   = len(df_pix_pos)
-            total_val   = df_pix_pos["valor_pago_num"].sum()
-            total_tar   = df_pix_pos["tarifa_num"].sum()
-            total_liq   = total_val - total_tar
+            col_vl, col_vr = st.columns(2)
 
-            k1, k2, k3, k4 = st.columns(4)
-            k1.metric("🔢 Transações",   total_pix)
-            k2.metric("💰 Valor Total",  f"R$ {total_val:,.2f}")
-            k3.metric("📉 Tarifas",      f"R$ {total_tar:,.2f}")
-            k4.metric("✅ Valor Líquido",f"R$ {total_liq:,.2f}")
-
-            st.divider()
-
-            # ── Conciliação PIX POS × OFX ─────────
-            with st.spinner("Conciliando PIX POS com OFX..."):
-                df_conc_pix, df_ofx_pix_usado = conciliar_pix_pos_ofx(
-                    df_pix_pos, df_ofx_raw, tolerancia_dias=2
-                )
-
-            # Adiciona _idx para vinculação manual
-            df_conc_pix = df_conc_pix.reset_index(drop=True)
-            df_conc_pix["_idx"] = df_conc_pix.index
-
-            # Aplica vínculos manuais
-            for vinc in st.session_state["vinculos_pix_pos"]:
-                for i in vinc.get("idx_pos", []) + vinc.get("idx_ofx", []):
-                    if i < len(df_conc_pix):
-                        df_conc_pix.at[i, "Status"] = "🔗 Vinculado Manualmente"
-
-            # Armazena status PIX no session_state para uso no pivot do Caixa
-            _pix_ok  = df_conc_pix["Status"].str.startswith("✅").sum()
-            _pix_man = df_conc_pix["Status"].str.startswith("🔗").sum()
-            _pix_err = df_conc_pix["Status"].str.startswith("❌").sum()
-            _pix_tot = len(df_conc_pix)
-            # Status geral PIX para o pivot (sem agrupamento por caixa — PIX POS não tem nº caixa)
-            if _pix_err > 0:   _status_pix_geral = "❌"
-            elif _pix_man > 0: _status_pix_geral = "🔗"
-            elif _pix_ok > 0:  _status_pix_geral = "✅"
-            else:              _status_pix_geral = "—"
-            st.session_state["_status_pix_geral"] = _status_pix_geral
-
-            # KPIs conciliação
-            st.markdown("#### Resultado da Conciliação")
-            p1, p2, p3, p4 = st.columns(4)
-            p1.metric("📋 Total",            _pix_tot)
-            p2.metric("✅ Conciliados",       f"{_pix_ok} ({_pix_ok/_pix_tot*100:.1f}%)" if _pix_tot else "0")
-            p3.metric("🔗 Vinc. Manual",      _pix_man)
-            p4.metric("❌ Não encontrados",   f"{_pix_err} ({_pix_err/_pix_tot*100:.1f}%)" if _pix_tot else "0")
-
-            # Filtro
-            status_opts = df_conc_pix["Status"].unique().tolist()
-            filtro_pix  = st.multiselect("Filtrar status:", status_opts,
-                                          default=status_opts, key="filtro_pix")
-            df_pix_show = df_conc_pix[df_conc_pix["Status"].isin(filtro_pix)].copy()
-
-            # Formata para exibição
-            df_pix_disp = df_pix_show.drop(columns=["_idx","idx_pix"], errors="ignore").copy()
-            for c in ["Valor Pago","Tarifa","Valor OFX"]:
-                df_pix_disp[c] = df_pix_disp[c].apply(
-                    lambda v: f"R$ {float(v):,.2f}" if str(v) not in ("","nan") else "")
-            st.dataframe(df_pix_disp, use_container_width=True, hide_index=True, height=400)
-
-            st.divider()
-
-            # ════════════════════════════════════════
-            # VINCULAÇÃO MANUAL — PIX POS
-            # ════════════════════════════════════════
-            st.markdown("#### 🔗 Vinculação Manual")
-
-            mask_pend_pix = ~df_conc_pix["Status"].str.startswith("✅") &                             ~df_conc_pix["Status"].str.startswith("🔗")
-            df_pend_pix = df_conc_pix[mask_pend_pix].copy()
-
-            if df_pend_pix.empty:
-                st.success("Todos os registros estão conciliados ou vinculados.")
-            else:
-                st.info(f"{len(df_pend_pix)} registro(s) pendente(s).")
-
-                df_pend_pos = df_pend_pix[df_pend_pix["Status"] != "❌ Não encontrado no POS"].copy()
-                df_pend_ofx = df_pend_pix[df_pend_pix["Status"] == "❌ Não encontrado no POS"].copy()
-
-                col_pl, col_pr = st.columns(2)
-
-                with col_pl:
-                    st.markdown("**1. PIX POS sem par no OFX:**")
-                    if df_pend_pos.empty:
-                        st.info("Nenhum pendente.")
-                        sel_idx_pos = []
-                    else:
-                        df_ed_pos = df_pend_pos[["_idx","Status","Data Pago","Identificador","Pagador","Valor Pago"]].copy()
-                        df_ed_pos = df_ed_pos.reset_index(drop=True)
-                        df_ed_pos["Valor Pago"] = df_ed_pos["Valor Pago"].apply(
-                            lambda v: f"R$ {float(v):,.2f}" if str(v) not in ("","nan") else "")
-                        df_ed_pos.insert(0, "✔", False)
-                        edited_pos = st.data_editor(
-                            df_ed_pos,
-                            column_config={
-                                "✔":           st.column_config.CheckboxColumn("✔",        width="small"),
-                                "_idx":        None,
-                                "Status":      st.column_config.TextColumn("Status",       width="medium"),
-                                "Data Pago":   st.column_config.TextColumn("Data",         width="small"),
-                                "Identificador":st.column_config.TextColumn("Identificador",width="large"),
-                                "Pagador":     st.column_config.TextColumn("Pagador",      width="medium"),
-                                "Valor Pago":  st.column_config.TextColumn("Valor",        width="medium"),
-                            },
-                            disabled=["_idx","Status","Data Pago","Identificador","Pagador","Valor Pago"],
-                            hide_index=True, use_container_width=True,
-                            key="ed_vinc_pos",
-                            height=min(400, 45 + len(df_ed_pos)*35),
-                        )
-                        sel_idx_pos = edited_pos[edited_pos["✔"]]["_idx"].astype(int).tolist()
-                        if sel_idx_pos:
-                            total_pos = df_conc_pix[df_conc_pix["_idx"].isin(sel_idx_pos)]["Valor Pago"].apply(
-                                lambda v: float(v) if str(v) not in ("","nan") else 0).sum()
-                            st.metric("Selecionado POS", f"R$ {total_pos:,.2f}")
-
-                with col_pr:
-                    st.markdown("**2. OFX PIX sem par no POS:**")
-                    if df_pend_ofx.empty:
-                        st.info("Nenhum pendente.")
-                        sel_idx_ofx = []
-                    else:
-                        df_ed_ofx = df_pend_ofx[["_idx","Status","Data OFX","Memo OFX","Valor OFX"]].copy()
-                        df_ed_ofx = df_ed_ofx.reset_index(drop=True)
-                        df_ed_ofx["Valor OFX"] = df_ed_ofx["Valor OFX"].apply(
-                            lambda v: f"R$ {float(v):,.2f}" if str(v) not in ("","nan") else "")
-                        df_ed_ofx.insert(0, "✔", False)
-                        edited_ofx = st.data_editor(
-                            df_ed_ofx,
-                            column_config={
-                                "✔":        st.column_config.CheckboxColumn("✔",     width="small"),
-                                "_idx":     None,
-                                "Status":   st.column_config.TextColumn("Status",   width="medium"),
-                                "Data OFX": st.column_config.TextColumn("Data",     width="small"),
-                                "Memo OFX": st.column_config.TextColumn("Memo",     width="large"),
-                                "Valor OFX":st.column_config.TextColumn("Valor",    width="medium"),
-                            },
-                            disabled=["_idx","Status","Data OFX","Memo OFX","Valor OFX"],
-                            hide_index=True, use_container_width=True,
-                            key="ed_vinc_ofx_pix",
-                            height=min(400, 45 + len(df_ed_ofx)*35),
-                        )
-                        sel_idx_ofx = edited_ofx[edited_ofx["✔"]]["_idx"].astype(int).tolist()
-                        if sel_idx_ofx:
-                            total_ofx = df_conc_pix[df_conc_pix["_idx"].isin(sel_idx_ofx)]["Valor OFX"].apply(
-                                lambda v: float(v) if str(v) not in ("","nan") else 0).sum()
-                            st.metric("Selecionado OFX", f"R$ {total_ofx:,.2f}")
-
-                # Comparativo e confirmação
-                st.markdown("---")
-                obs_pix = st.text_input("Observação (opcional):", key="obs_vinc_pix",
-                                        placeholder="Ex: PIX recebido fora do período, consolidado no dia seguinte...")
-
-                pode_vincular_pix = len(sel_idx_pos) > 0 or len(sel_idx_ofx) > 0
-                if pode_vincular_pix:
-                    val_pos_sel = df_conc_pix[df_conc_pix["_idx"].isin(sel_idx_pos)]["Valor Pago"].apply(
-                        lambda v: float(v) if str(v) not in ("","nan") else 0).sum()
-                    val_ofx_sel = df_conc_pix[df_conc_pix["_idx"].isin(sel_idx_ofx)]["Valor OFX"].apply(
-                        lambda v: float(v) if str(v) not in ("","nan") else 0).sum()
-                    diff_pix = abs(val_pos_sel - val_ofx_sel)
-
-                    mc1, mc2, mc3 = st.columns(3)
-                    mc1.metric("Total POS selecionado", f"R$ {val_pos_sel:,.2f}",
-                               delta=f"{len(sel_idx_pos)} registro(s)")
-                    mc2.metric("Total OFX selecionado", f"R$ {val_ofx_sel:,.2f}",
-                               delta=f"{len(sel_idx_ofx)} registro(s)")
-                    mc3.metric("Diferença", f"R$ {diff_pix:,.2f}",
-                               delta_color="off" if diff_pix < 0.02 else "inverse")
-
-                    if st.button("🔗 Confirmar Vínculo Manual PIX", type="primary", key="btn_vinc_pix"):
-                        st.session_state["vinculos_pix_pos"].append({
-                            "idx_pos":  sel_idx_pos,
-                            "idx_ofx":  sel_idx_ofx,
-                            "obs":      obs_pix,
-                            "val_pos":  val_pos_sel,
-                            "val_ofx":  val_ofx_sel,
-                        })
-                        st.success(f"🔗 Vínculo criado!")
-                        st.rerun()
+            with col_vl:
+                st.markdown("**PIX POS/TEF sem par no OFX:**")
+                if df_pend_pix.empty:
+                    st.info("Nenhum pendente.")
+                    sel_idx_pix = []
                 else:
-                    st.caption("Selecione ao menos um registro para vincular.")
+                    df_ed_pix = df_pend_pix[["_idx","Status","Origem","Data Pago","Pagador","Valor Pago"]].copy().reset_index(drop=True)
+                    df_ed_pix["Valor Pago"] = df_ed_pix["Valor Pago"].apply(
+                        lambda v: f"R$ {float(v):,.2f}" if str(v) not in ("","nan") else "")
+                    df_ed_pix.insert(0, "✔", False)
+                    edited_pix = st.data_editor(
+                        df_ed_pix,
+                        column_config={
+                            "✔":        st.column_config.CheckboxColumn("✔",       width="small"),
+                            "_idx":     None,
+                            "Status":   st.column_config.TextColumn("Status",     width="medium"),
+                            "Origem":   st.column_config.TextColumn("Origem",     width="small"),
+                            "Data Pago":st.column_config.TextColumn("Data",       width="small"),
+                            "Pagador":  st.column_config.TextColumn("Pagador",    width="medium"),
+                            "Valor Pago":st.column_config.TextColumn("Valor",     width="medium"),
+                        },
+                        disabled=["_idx","Status","Origem","Data Pago","Pagador","Valor Pago"],
+                        hide_index=True, use_container_width=True,
+                        key="ed_vinc_pix_unified",
+                        height=min(400, 45 + len(df_ed_pix)*35),
+                    )
+                    sel_idx_pix = edited_pix[edited_pix["✔"]]["_idx"].astype(int).tolist()
+                    if sel_idx_pix:
+                        tot_sel = df_conc_pix[df_conc_pix["_idx"].isin(sel_idx_pix)]["Valor Pago"].apply(
+                            lambda v: float(v) if str(v) not in ("","nan") else 0).sum()
+                        st.metric("Selecionado PIX", f"R$ {tot_sel:,.2f}",
+                                  delta=f"{len(sel_idx_pix)} registro(s)")
 
-                # Lista vínculos criados
-                if st.session_state["vinculos_pix_pos"]:
-                    st.divider()
-                    st.markdown(f"**Vínculos manuais: {len(st.session_state['vinculos_pix_pos'])}**")
-                    for i, v in enumerate(st.session_state["vinculos_pix_pos"]):
-                        with st.expander(
-                            f"🔗 Vínculo #{i+1} — POS R$ {v['val_pos']:,.2f} × OFX R$ {v['val_ofx']:,.2f}"
-                            + (f" | {v['obs']}" if v.get('obs') else ""), expanded=False
-                        ):
-                            vc1, vc2 = st.columns(2)
-                            vc1.write(f"**Índices POS:** {v['idx_pos']}")
-                            vc2.write(f"**Índices OFX:** {v['idx_ofx']}")
-                            if st.button("🗑️ Remover", key=f"rm_pix_{i}"):
-                                st.session_state["vinculos_pix_pos"].pop(i)
-                                st.rerun()
+            with col_vr:
+                st.markdown("**OFX PIX sem par no POS/TEF:**")
+                if df_pend_ofx.empty:
+                    st.info("Nenhum pendente.")
+                    sel_idx_ofx = []
+                else:
+                    df_ed_ofx = df_pend_ofx[["_idx","Status","Data OFX","Memo OFX","Valor OFX"]].copy().reset_index(drop=True)
+                    df_ed_ofx["Valor OFX"] = df_ed_ofx["Valor OFX"].apply(
+                        lambda v: f"R$ {float(v):,.2f}" if str(v) not in ("","nan") else "")
+                    df_ed_ofx.insert(0, "✔", False)
+                    edited_ofx = st.data_editor(
+                        df_ed_ofx,
+                        column_config={
+                            "✔":        st.column_config.CheckboxColumn("✔",     width="small"),
+                            "_idx":     None,
+                            "Status":   st.column_config.TextColumn("Status",   width="medium"),
+                            "Data OFX": st.column_config.TextColumn("Data",     width="small"),
+                            "Memo OFX": st.column_config.TextColumn("Memo",     width="large"),
+                            "Valor OFX":st.column_config.TextColumn("Valor",    width="medium"),
+                        },
+                        disabled=["_idx","Status","Data OFX","Memo OFX","Valor OFX"],
+                        hide_index=True, use_container_width=True,
+                        key="ed_vinc_ofx_pix_unified",
+                        height=min(400, 45 + len(df_ed_ofx)*35),
+                    )
+                    sel_idx_ofx = edited_ofx[edited_ofx["✔"]]["_idx"].astype(int).tolist()
+                    if sel_idx_ofx:
+                        tot_ofx = df_conc_pix[df_conc_pix["_idx"].isin(sel_idx_ofx)]["Valor OFX"].apply(
+                            lambda v: float(v) if str(v) not in ("","nan") else 0).sum()
+                        st.metric("Selecionado OFX", f"R$ {tot_ofx:,.2f}",
+                                  delta=f"{len(sel_idx_ofx)} registro(s)")
 
-            # ── Export Excel ──
-            def exportar_pix_pos(df_pix, df_conc, vinculos):
-                out = io.BytesIO()
-                df_conc_exp = df_conc.drop(columns=["_idx","idx_pix"], errors="ignore")
-                with pd.ExcelWriter(out, engine="xlsxwriter") as writer:
-                    df_pix.drop(columns=["idx_pix","valor_pago_num","valor_emitido_num","tarifa_num","data_pago"],
-                                errors="ignore").to_excel(writer, sheet_name="PIX POS Completo", index=False)
-                    df_conc_exp.to_excel(writer, sheet_name="Conciliação PIX POS", index=False)
-                    if vinculos:
-                        pd.DataFrame([{
-                            "Vínculo #": i+1,
-                            "Índices POS": str(v["idx_pos"]),
-                            "Índices OFX": str(v["idx_ofx"]),
-                            "Valor POS":   v["val_pos"],
-                            "Valor OFX":   v["val_ofx"],
-                            "Diferença":   abs(v["val_pos"]-v["val_ofx"]),
-                            "Observação":  v.get("obs",""),
-                        } for i, v in enumerate(vinculos)]).to_excel(
-                            writer, sheet_name="Vínculos Manuais PIX", index=False)
-                    wb = writer.book
-                    fmt_h   = wb.add_format({"bold":True,"bg_color":"#1F3864","font_color":"white","border":1})
-                    fmt_ok  = wb.add_format({"bg_color":"#C6EFCE"})
-                    fmt_man = wb.add_format({"bg_color":"#BDD7EE"})
-                    fmt_e   = wb.add_format({"bg_color":"#FFC7CE"})
-                    ws2 = writer.sheets["Conciliação PIX POS"]
-                    for cn, col in enumerate(df_conc_exp.columns):
-                        ws2.write(0, cn, col, fmt_h); ws2.set_column(cn, cn, 22)
-                    for rn in range(1, len(df_conc_exp)+1):
-                        s = str(df_conc_exp.iloc[rn-1]["Status"])
-                        ws2.set_row(rn, None, fmt_ok if "✅" in s else (fmt_man if "🔗" in s else fmt_e))
-                return out.getvalue()
+            st.markdown("---")
+            obs_pix_vinc = st.text_input("Observação (opcional):", key="obs_vinc_pix_u",
+                                          placeholder="Ex: PIX recebido fora do período...")
 
-            excel_pix = exportar_pix_pos(df_pix_pos, df_conc_pix, st.session_state["vinculos_pix_pos"])
-            st.download_button(
-                "⬇️ Exportar PIX POS (Excel)",
-                data=excel_pix,
-                file_name=f"pix_pos_{acctid_pix}_{datetime.today().strftime('%Y%m%d_%H%M')}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True,
+            pode_vincular = len(sel_idx_pix) > 0 or len(sel_idx_ofx) > 0
+            if pode_vincular:
+                val_pix_sel = df_conc_pix[df_conc_pix["_idx"].isin(sel_idx_pix)]["Valor Pago"].apply(
+                    lambda v: float(v) if str(v) not in ("","nan") else 0).sum()
+                val_ofx_sel = df_conc_pix[df_conc_pix["_idx"].isin(sel_idx_ofx)]["Valor OFX"].apply(
+                    lambda v: float(v) if str(v) not in ("","nan") else 0).sum()
+                diff_vinc = abs(val_pix_sel - val_ofx_sel)
+
+                mc1, mc2, mc3 = st.columns(3)
+                mc1.metric("Total PIX selecionado", f"R$ {val_pix_sel:,.2f}",
+                           delta=f"{len(sel_idx_pix)} registro(s)")
+                mc2.metric("Total OFX selecionado", f"R$ {val_ofx_sel:,.2f}",
+                           delta=f"{len(sel_idx_ofx)} registro(s)")
+                mc3.metric("Diferença", f"R$ {diff_vinc:,.2f}",
+                           delta_color="off" if diff_vinc < 0.02 else "inverse")
+
+                if st.button("🔗 Confirmar Vínculo Manual PIX", type="primary", key="btn_vinc_pix_u"):
+                    st.session_state["vinculos_pix_pos"].append({
+                        "idx_pos": sel_idx_pix,
+                        "idx_ofx": sel_idx_ofx,
+                        "obs":     obs_pix_vinc,
+                        "val_pos": val_pix_sel,
+                        "val_ofx": val_ofx_sel,
+                    })
+                    st.success("🔗 Vínculo criado!")
+                    st.rerun()
+            else:
+                st.caption("Selecione ao menos um registro para vincular.")
+
+            # Lista de vínculos
+            todos_vinc = (
+                [(v, "POS/TEF") for v in st.session_state["vinculos_pix_pos"]] +
+                [(v, "TEF")     for v in st.session_state["vinculos_pix_tef"]]
             )
+            if todos_vinc:
+                st.divider()
+                st.markdown(f"**Vínculos manuais: {len(todos_vinc)}**")
+                for i, (v, origem) in enumerate(todos_vinc):
+                    with st.expander(
+                        f"🔗 Vínculo #{i+1} ({origem}) — "
+                        f"PIX R$ {v.get('val_pos',0):,.2f} × OFX R$ {v.get('val_ofx',0):,.2f}"
+                        + (f" | {v['obs']}" if v.get('obs') else ""), expanded=False
+                    ):
+                        vc1, vc2 = st.columns(2)
+                        vc1.write(f"**Índices PIX:** {v.get('idx_pos',[])}")
+                        vc2.write(f"**Índices OFX:** {v.get('idx_ofx',[])}")
+                        if st.button("🗑️ Remover", key=f"rm_pix_u_{i}"):
+                            if origem == "TEF":
+                                st.session_state["vinculos_pix_tef"].pop(i - len(st.session_state["vinculos_pix_pos"]))
+                            else:
+                                st.session_state["vinculos_pix_pos"].pop(i)
+                            st.rerun()
+
+        # ── Export ──
+        def exportar_pix_unificado(df_conc, meta_p, meta_t, vinc_pos, vinc_tef):
+            out = io.BytesIO()
+            df_exp = df_conc.drop(columns=["_idx","_src_idx"], errors="ignore")
+            with pd.ExcelWriter(out, engine="xlsxwriter") as writer:
+                df_exp.to_excel(writer, sheet_name="Conciliação PIX", index=False)
+                todos = vinc_pos + vinc_tef
+                if todos:
+                    pd.DataFrame([{
+                        "Vínculo #":    i+1,
+                        "Índices PIX":  str(v.get("idx_pos",[])),
+                        "Índices OFX":  str(v.get("idx_ofx",[])),
+                        "Valor PIX":    v.get("val_pos",0),
+                        "Valor OFX":    v.get("val_ofx",0),
+                        "Diferença":    abs(v.get("val_pos",0)-v.get("val_ofx",0)),
+                        "Observação":   v.get("obs",""),
+                    } for i, v in enumerate(todos)]).to_excel(
+                        writer, sheet_name="Vínculos Manuais PIX", index=False)
+                wb   = writer.book
+                fmt_h   = wb.add_format({"bold":True,"bg_color":"#1F3864","font_color":"white","border":1})
+                fmt_ok  = wb.add_format({"bg_color":"#C6EFCE"})
+                fmt_man = wb.add_format({"bg_color":"#BDD7EE"})
+                fmt_e   = wb.add_format({"bg_color":"#FFC7CE"})
+                ws2 = writer.sheets["Conciliação PIX"]
+                for cn, col in enumerate(df_exp.columns):
+                    ws2.write(0, cn, col, fmt_h); ws2.set_column(cn, cn, 22)
+                for rn in range(1, len(df_exp)+1):
+                    s = str(df_exp.iloc[rn-1]["Status"])
+                    ws2.set_row(rn, None, fmt_ok if "✅" in s else (fmt_man if "🔗" in s else fmt_e))
+            return out.getvalue()
+
+        excel_pix = exportar_pix_unificado(
+            df_conc_pix, meta_pos, meta_tef,
+            st.session_state["vinculos_pix_pos"],
+            st.session_state["vinculos_pix_tef"],
+        )
+        st.download_button(
+            "⬇️ Exportar PIX (Excel)",
+            data=excel_pix,
+            file_name=f"pix_{datetime.today().strftime('%Y%m%d_%H%M')}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+        )
+
 
 st.divider()
 
