@@ -507,25 +507,53 @@ def parse_caixa(file) -> pd.DataFrame:
 def conciliar_caixa_rede(df_caixa: pd.DataFrame,
                           df_rede: pd.DataFrame) -> pd.DataFrame:
     """
-    Cruza caixa (cartões) com intermediadora em 2 etapas:
+    Cruza caixa (cartões) com intermediadora via merge vetorizado — O(n) em vez de O(n²).
 
-    1. C.V. exato (AutExtRef = C.V.) — sem restrição de data.
-       Status: ✅ Conciliado (C.V.) ou ⚠️ C.V. ok, valor diverge
-
-    2. Fallback automático: valor exato + bandeira + diferença de data ≤ 1 dia.
-       Status: ✅ Conciliado (valor+data)
-
-    Qualquer coisa fora disso fica ❌ e vai para vinculação manual.
+    Etapa 1 : C.V. exato (AutExtRef = C.V.) — qualquer data
+    Etapa 1.5: E-commerce — valor + bandeira, até 90 dias
+    Etapa 2 : valor + bandeira + data ≤ 1 dia
+    Resto   : ❌ → vinculação manual
     """
-    from datetime import timedelta
+    import numpy as np
 
-    df_cart  = df_caixa[df_caixa["forma_norm"].isin(["CREDITO", "DEBITO"])].copy()
-    df_rede2 = df_rede.copy()
-    df_rede2["cv_str"] = df_rede2["cv"].astype(str).str.strip()
+    df_cart  = df_caixa[df_caixa["forma_norm"].isin(["CREDITO", "DEBITO"])].copy().reset_index(drop=True)
+    df_rede2 = df_rede.copy().reset_index(drop=True)
+    df_rede2["cv_str"]  = df_rede2["cv"].astype(str).str.strip()
+    df_rede2["captura"] = df_rede2.get("captura", pd.Series([""] * len(df_rede2))).astype(str).str.upper()
 
-    resultados  = []
+    # Índice permanente para rastrear quais registros da Rede já foram usados
+    df_rede2["_rede_idx"] = df_rede2.index
+    df_cart["_cart_idx"]  = df_cart.index
+
+    # Colunas de saída padrão
+    COLS_REDE = ["_rede_idx", "cv", "data", "bandeira", "valor_bruto", "captura"]
+    vazia = {c: "" for c in ["C.V. Rede","Data Rede","Bandeira Rede","Valor Rede","Captura"]}
+
+    resultado_rows = []
     rede_usados = set()
 
+    def primeiro_match(candidatos):
+        """Retorna (rede_idx, row) do primeiro candidato não usado, ou None."""
+        for _, r in candidatos.iterrows():
+            if r["_rede_idx"] not in rede_usados:
+                return r
+        return None
+
+    # ── Pré-build de índices para lookup rápido ──────────────────────────
+    # CV → lista de rede_idx
+    cv_index = {}
+    for r_idx, r in df_rede2.iterrows():
+        cv = r["cv_str"]
+        if cv and cv not in ("nan",""):
+            cv_index.setdefault(cv, []).append(r_idx)
+
+    # (valor_centavos, bandeira) → lista de (rede_idx, data)  — para etapas 1.5 e 2
+    val_band_index = {}
+    for r_idx, r in df_rede2.iterrows():
+        key = (round(r["valor_bruto"], 2), r["bandeira"])
+        val_band_index.setdefault(key, []).append(r_idx)
+
+    # ── Loop por registro do caixa ───────────────────────────────────────
     for _, rc in df_cart.iterrows():
         status        = "❌ Não encontrado na Rede"
         match_cv      = ""
@@ -534,86 +562,71 @@ def conciliar_caixa_rede(df_caixa: pd.DataFrame,
         match_band    = ""
         match_captura = ""
 
-        # ── Etapa 1: C.V. exato (AutExtRef) — qualquer data ──
-        if rc["AutExtRef"]:
-            cands = df_rede2[
-                (df_rede2["cv_str"] == rc["AutExtRef"]) &
-                (~df_rede2.index.isin(rede_usados))
-            ]
-            if not cands.empty:
-                idx = cands.index[0]
-                rede_usados.add(idx)
-                r        = cands.iloc[0]
+        # Etapa 1: C.V. exato
+        if rc["AutExtRef"] and rc["AutExtRef"] not in ("", "nan"):
+            for r_idx in cv_index.get(rc["AutExtRef"], []):
+                if r_idx in rede_usados:
+                    continue
+                r = df_rede2.iloc[r_idx]
                 diff_val = abs(rc["valor"] - r["valor_bruto"])
+                rede_usados.add(r_idx)
                 status        = "✅ Conciliado (C.V.)" if diff_val < 0.02 else "⚠️ C.V. ok, valor diverge"
                 match_cv      = r["cv"]
                 match_data    = str(r["data"])
                 match_val     = r["valor_bruto"]
                 match_band    = r["bandeira"]
-                match_captura = str(r.get("captura", ""))
+                match_captura = r["captura"]
+                break
 
-        # ── Etapa 1.5: E-commerce — valor + bandeira, até 90 dias ──
-        # Reservas hoteleiras: cliente paga antes na intermediadora (E-commerce)
-        # e o caixa só registra quando utiliza o serviço (pode ser semanas depois)
+        # Etapa 1.5: E-commerce, até 90 dias
         if "❌" in status:
             data_cx = rc["data"]
-            for idx2, r2 in df_rede2.iterrows():
-                if idx2 in rede_usados:
+            key = (round(rc["valor"], 2), rc["bandeira_norm"])
+            for r_idx in val_band_index.get(key, []):
+                if r_idx in rede_usados:
                     continue
-                if str(r2.get("captura", "")).upper() != "E-COMMERCE":
-                    continue
-                if abs(rc["valor"] - r2["valor_bruto"]) > 0.02:
-                    continue
-                b_cx = rc["bandeira_norm"]
-                b_r2 = str(r2.get("bandeira", "")).upper()
-                if b_cx and b_r2 and b_cx != b_r2:
+                r = df_rede2.iloc[r_idx]
+                if r["captura"] != "E-COMMERCE":
                     continue
                 try:
-                    diff_dias = abs((data_cx - r2["data"]).days)
+                    diff_dias = abs((data_cx - r["data"]).days)
                 except Exception:
                     diff_dias = 999
                 if diff_dias > 90:
                     continue
-                rede_usados.add(idx2)
+                rede_usados.add(r_idx)
                 status        = "✅ E-commerce (reserva)"
-                match_cv      = r2["cv"]
-                match_data    = str(r2["data"])
-                match_val     = r2["valor_bruto"]
-                match_band    = r2["bandeira"]
-                match_captura = str(r2.get("captura", ""))
+                match_cv      = r["cv"]
+                match_data    = str(r["data"])
+                match_val     = r["valor_bruto"]
+                match_band    = r["bandeira"]
+                match_captura = r["captura"]
                 break
 
-        # ── Etapa 2: valor exato + bandeira + data ≤ 1 dia ──
+        # Etapa 2: valor + bandeira + data ≤ 1 dia
         if "❌" in status:
             data_cx = rc["data"]
-            for idx2, r2 in df_rede2.iterrows():
-                if idx2 in rede_usados:
+            key = (round(rc["valor"], 2), rc["bandeira_norm"])
+            for r_idx in val_band_index.get(key, []):
+                if r_idx in rede_usados:
                     continue
-                # Valor idêntico (centavos)
-                if abs(rc["valor"] - r2["valor_bruto"]) > 0.02:
-                    continue
-                # Bandeira compatível
-                b_cx = rc["bandeira_norm"]
-                b_r2 = str(r2.get("bandeira", "")).upper()
-                if b_cx and b_r2 and b_cx != b_r2:
-                    continue
-                # Data dentro de 1 dia (em qualquer direção)
+                r = df_rede2.iloc[r_idx]
                 try:
-                    diff_dias = abs((data_cx - r2["data"]).days)
+                    diff_dias = abs((data_cx - r["data"]).days)
                 except Exception:
                     diff_dias = 999
                 if diff_dias > 1:
                     continue
-                rede_usados.add(idx2)
+                rede_usados.add(r_idx)
                 status        = "✅ Conciliado (valor+data)"
-                match_cv      = r2["cv"]
-                match_data    = str(r2["data"])
-                match_val     = r2["valor_bruto"]
-                match_band    = r2["bandeira"]
-                match_captura = str(r2.get("captura", ""))
+                match_cv      = r["cv"]
+                match_data    = str(r["data"])
+                match_val     = r["valor_bruto"]
+                match_band    = r["bandeira"]
+                match_captura = r["captura"]
                 break
 
-        resultados.append({
+        resultado_rows.append({
             "Status":        status,
             "Caixa":         rc["Caixa"],
             "Forma":         rc["Forma Pagamento"],
@@ -632,7 +645,7 @@ def conciliar_caixa_rede(df_caixa: pd.DataFrame,
     # Registros da Rede sem par no caixa
     for idx2, r2 in df_rede2.iterrows():
         if idx2 not in rede_usados:
-            resultados.append({
+            resultado_rows.append({
                 "Status":        "❌ Não encontrado no Caixa",
                 "Caixa":         "",
                 "Forma":         r2.get("tipo_norm", ""),
@@ -648,7 +661,7 @@ def conciliar_caixa_rede(df_caixa: pd.DataFrame,
                 "Captura":       str(r2.get("captura", "")),
             })
 
-    return pd.DataFrame(resultados)
+    return pd.DataFrame(resultado_rows)
 
 
 # ─────────────────────────────────────────────
