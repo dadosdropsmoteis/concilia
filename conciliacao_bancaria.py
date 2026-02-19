@@ -504,54 +504,74 @@ def parse_caixa(file) -> pd.DataFrame:
 
 
 def conciliar_caixa_rede(df_caixa: pd.DataFrame,
-                          df_rede: pd.DataFrame,
-                          tolerancia_minutos: int = 30) -> pd.DataFrame:
+                          df_rede: pd.DataFrame) -> pd.DataFrame:
     """
-    Cruza caixa (cartões) com intermediadora por AutExtRef = C.V.
-    Fallback: valor + data + bandeira + tipo dentro de tolerância de minutos.
+    Cruza caixa (cartões) com intermediadora em 2 etapas:
+
+    1. C.V. exato (AutExtRef = C.V.) — sem restrição de data.
+       Status: ✅ Conciliado (C.V.) ou ⚠️ C.V. ok, valor diverge
+
+    2. Fallback automático: valor exato + bandeira + diferença de data ≤ 1 dia.
+       Status: ✅ Conciliado (valor+data)
+
+    Qualquer coisa fora disso fica ❌ e vai para vinculação manual.
     """
     from datetime import timedelta
 
-    df_cart = df_caixa[df_caixa["forma_norm"].isin(["CREDITO", "DEBITO"])].copy()
+    df_cart  = df_caixa[df_caixa["forma_norm"].isin(["CREDITO", "DEBITO"])].copy()
     df_rede2 = df_rede.copy()
     df_rede2["cv_str"] = df_rede2["cv"].astype(str).str.strip()
 
-    resultados = []
+    resultados  = []
     rede_usados = set()
 
     for _, rc in df_cart.iterrows():
-        status = "❌ Não encontrado na Rede"
-        match_cv = ""
+        status     = "❌ Não encontrado na Rede"
+        match_cv   = ""
         match_data = ""
         match_val  = ""
         match_band = ""
 
-        # 1) Tenta por C.V. (AutExtRef)
+        # ── Etapa 1: C.V. exato (AutExtRef) — qualquer data ──
         if rc["AutExtRef"]:
-            mask_cv = df_rede2["cv_str"] == rc["AutExtRef"]
-            cands = df_rede2[mask_cv & ~df_rede2.index.isin(rede_usados)]
+            cands = df_rede2[
+                (df_rede2["cv_str"] == rc["AutExtRef"]) &
+                (~df_rede2.index.isin(rede_usados))
+            ]
             if not cands.empty:
                 idx = cands.index[0]
                 rede_usados.add(idx)
-                r = cands.iloc[0]
+                r        = cands.iloc[0]
                 diff_val = abs(rc["valor"] - r["valor_bruto"])
-                status   = "✅ Conciliado (C.V.)" if diff_val < 0.02 else "⚠️ C.V. ok, valor diverge"
+                status     = "✅ Conciliado (C.V.)" if diff_val < 0.02 else "⚠️ C.V. ok, valor diverge"
                 match_cv   = r["cv"]
                 match_data = str(r["data"])
                 match_val  = r["valor_bruto"]
                 match_band = r["bandeira"]
 
-        # 2) Fallback: valor + data + bandeira
+        # ── Etapa 2: valor exato + bandeira + data ≤ 1 dia ──
         if "❌" in status:
+            data_cx = rc["data"]
             for idx2, r2 in df_rede2.iterrows():
-                if idx2 in rede_usados: continue
-                if abs(rc["valor"] - r2["valor_bruto"]) > 0.02: continue
-                if rc["data"] != r2["data"]: continue
-                b_caixa = rc["bandeira_norm"]
-                b_rede  = str(r2.get("bandeira", "")).upper()
-                if b_caixa and b_rede and b_caixa != b_rede: continue
+                if idx2 in rede_usados:
+                    continue
+                # Valor idêntico (centavos)
+                if abs(rc["valor"] - r2["valor_bruto"]) > 0.02:
+                    continue
+                # Bandeira compatível
+                b_cx = rc["bandeira_norm"]
+                b_r2 = str(r2.get("bandeira", "")).upper()
+                if b_cx and b_r2 and b_cx != b_r2:
+                    continue
+                # Data dentro de 1 dia (em qualquer direção)
+                try:
+                    diff_dias = abs((data_cx - r2["data"]).days)
+                except Exception:
+                    diff_dias = 999
+                if diff_dias > 1:
+                    continue
                 rede_usados.add(idx2)
-                status   = "⚠️ Conciliado (valor+data)"
+                status     = "✅ Conciliado (valor+data)"
                 match_cv   = r2["cv"]
                 match_data = str(r2["data"])
                 match_val  = r2["valor_bruto"]
@@ -559,34 +579,36 @@ def conciliar_caixa_rede(df_caixa: pd.DataFrame,
                 break
 
         resultados.append({
-            "Status":         status,
-            "Caixa":          rc["Caixa"],
-            "Forma":          rc["Forma Pagamento"],
-            "Bandeira Cx":    rc["bandeira_norm"],
-            "Data/Hora":      rc["data_hora"].strftime("%d/%m/%Y %H:%M") if pd.notna(rc["data_hora"]) else "",
-            "Valor Caixa":    rc["valor"],
-            "AutExtRef":      rc["AutExtRef"],
-            "C.V. Rede":      match_cv,
-            "Data Rede":      match_data,
-            "Bandeira Rede":  match_band,
-            "Valor Rede":     match_val,
+            "Status":        status,
+            "Caixa":         rc["Caixa"],
+            "Forma":         rc["Forma Pagamento"],
+            "forma_norm":    rc["forma_norm"],
+            "Bandeira Cx":   rc["bandeira_norm"],
+            "Data/Hora":     rc["data_hora"].strftime("%d/%m/%Y %H:%M") if pd.notna(rc["data_hora"]) else "",
+            "Valor Caixa":   rc["valor"],
+            "AutExtRef":     rc["AutExtRef"],
+            "C.V. Rede":     match_cv,
+            "Data Rede":     match_data,
+            "Bandeira Rede": match_band,
+            "Valor Rede":    match_val,
         })
 
     # Registros da Rede sem par no caixa
     for idx2, r2 in df_rede2.iterrows():
         if idx2 not in rede_usados:
             resultados.append({
-                "Status":         "❌ Não encontrado no Caixa",
-                "Caixa":          "",
-                "Forma":          r2.get("tipo_norm", ""),
-                "Bandeira Cx":    "",
-                "Data/Hora":      "",
-                "Valor Caixa":    "",
-                "AutExtRef":      "",
-                "C.V. Rede":      r2["cv"],
-                "Data Rede":      str(r2["data"]),
-                "Bandeira Rede":  r2["bandeira"],
-                "Valor Rede":     r2["valor_bruto"],
+                "Status":        "❌ Não encontrado no Caixa",
+                "Caixa":         "",
+                "Forma":         r2.get("tipo_norm", ""),
+                "forma_norm":    r2.get("tipo_norm", ""),
+                "Bandeira Cx":   "",
+                "Data/Hora":     "",
+                "Valor Caixa":   "",
+                "AutExtRef":     "",
+                "C.V. Rede":     r2["cv"],
+                "Data Rede":     str(r2["data"]),
+                "Bandeira Rede": r2["bandeira"],
+                "Valor Rede":    r2["valor_bruto"],
             })
 
     return pd.DataFrame(resultados)
@@ -629,6 +651,9 @@ with st.sidebar:
 # ─────────────────────────────────────────────
 if "vinculos_manuais" not in st.session_state:
     st.session_state["vinculos_manuais"] = {}
+if "vinculos_caixa" not in st.session_state:
+    st.session_state["vinculos_caixa"] = []
+    # Lista de dicts: {"idx_caixa": [ints], "idx_rede": [ints], "obs": str}
 
 # ─────────────────────────────────────────────
 # ESTABELECIMENTOS
@@ -1241,6 +1266,16 @@ with aba_caixa:
         with st.spinner("Conciliando caixa com intermediadora..."):
             df_conc_caixa = conciliar_caixa_rede(df_caixa, df_rede_para_caixa)
 
+        # Adiciona índice permanente para referência nos vínculos manuais
+        df_conc_caixa = df_conc_caixa.reset_index(drop=True)
+        df_conc_caixa["_idx"] = df_conc_caixa.index
+
+        # Aplica vínculos manuais da sessão
+        for vinc in st.session_state["vinculos_caixa"]:
+            for i in vinc.get("idx_caixa", []) + vinc.get("idx_rede", []):
+                if i < len(df_conc_caixa):
+                    df_conc_caixa.at[i, "Status"] = "🔗 Vinculado Manualmente"
+
         # ── Resumo por caixa ───────────────────
         st.markdown("#### Resumo por Caixa e Forma de Pagamento")
 
@@ -1254,13 +1289,15 @@ with aba_caixa:
         def status_conc_por_caixa(df_conc: pd.DataFrame, forma: str) -> dict:
             """Retorna dict {caixa: emoji_status} para uma forma de pagamento."""
             resultado = {}
-            sub = df_conc[df_conc["Forma"] == forma].copy()
+            sub = df_conc[df_conc["forma_norm"] == forma].copy()
             for caixa, grp in sub.groupby("Caixa"):
                 statuses = grp["Status"].tolist()
                 if any("❌" in s for s in statuses):
                     resultado[caixa] = "❌"
                 elif any("⚠️" in s for s in statuses):
                     resultado[caixa] = "⚠️"
+                elif any("🔗" in s for s in statuses):
+                    resultado[caixa] = "🔗"
                 else:
                     resultado[caixa] = "✅"
             return resultado
@@ -1344,41 +1381,202 @@ with aba_caixa:
         filtro_cx = st.multiselect("Filtrar status:", status_cx, default=status_cx, key="filtro_cx")
         df_cx_show = df_conc_caixa[df_conc_caixa["Status"].isin(filtro_cx)].copy()
 
-        # Formata valores
+        # Formata valores para exibição
+        df_cx_disp = df_cx_show.drop(columns=["_idx","forma_norm"], errors="ignore").copy()
         for c in ["Valor Caixa", "Valor Rede"]:
-            df_cx_show[c] = df_cx_show[c].apply(
+            df_cx_disp[c] = df_cx_disp[c].apply(
                 lambda v: f"R$ {float(v):,.2f}" if str(v) not in ("", "nan") else ""
             )
 
-        st.dataframe(df_cx_show, use_container_width=True, height=420)
+        st.dataframe(df_cx_disp, use_container_width=True, height=400)
 
-        # ── Detalhes Divergentes ───────────────
-        diverg = df_conc_caixa[df_conc_caixa["Status"].str.startswith("❌")].copy()
-        if not diverg.empty:
-            with st.expander(f"❌ Detalhes dos não encontrados ({len(diverg)} registros)"):
-                st.dataframe(diverg, use_container_width=True)
+        # ════════════════════════════════════════
+        # VINCULAÇÃO MANUAL — CAIXA
+        # ════════════════════════════════════════
+        st.divider()
+        st.markdown("#### 🔗 Vinculação Manual")
+
+        # Separa pendentes (não-✅ e não-🔗)
+        mask_pend = ~df_conc_caixa["Status"].str.startswith("✅")
+        mask_pend &= ~df_conc_caixa["Status"].str.startswith("🔗")
+        df_pend = df_conc_caixa[mask_pend].copy()
+
+        if df_pend.empty:
+            st.success("Todos os registros estão conciliados ou vinculados.")
+        else:
+            n_pend = len(df_pend)
+            st.info(f"{n_pend} registro(s) pendente(s) de conciliação manual.")
+
+            # Separa lado Caixa e lado Rede
+            df_lado_cx   = df_pend[df_pend["Status"] != "❌ Não encontrado no Caixa"].copy()
+            df_lado_rede = df_pend[df_pend["Status"] == "❌ Não encontrado no Caixa"].copy()
+
+            col_esq, col_dir = st.columns(2)
+
+            # ── Lado Caixa ──────────────────────
+            with col_esq:
+                st.markdown("**1. Selecione do lado Caixa:**")
+                if df_lado_cx.empty:
+                    st.info("Nenhum pendente do lado Caixa.")
+                    sel_idx_cx = []
+                else:
+                    df_ed_cx = df_lado_cx[["_idx","Status","Caixa","Forma","Data/Hora","Valor Caixa","AutExtRef"]].copy()
+                    df_ed_cx["Valor Caixa"] = df_ed_cx["Valor Caixa"].apply(
+                        lambda v: f"R$ {float(v):,.2f}" if str(v) not in ("","nan") else "")
+                    df_ed_cx.insert(0, "✔", False)
+                    edited_cx = st.data_editor(
+                        df_ed_cx.drop(columns=["_idx"]),
+                        column_config={
+                            "✔": st.column_config.CheckboxColumn("✔", width="small"),
+                            "Status":     st.column_config.TextColumn("Status",    width="medium"),
+                            "Caixa":      st.column_config.TextColumn("Caixa",     width="small"),
+                            "Forma":      st.column_config.TextColumn("Forma",     width="small"),
+                            "Data/Hora":  st.column_config.TextColumn("Data/Hora", width="medium"),
+                            "Valor Caixa":st.column_config.TextColumn("Valor",     width="medium"),
+                            "AutExtRef":  st.column_config.TextColumn("AutExtRef", width="medium"),
+                        },
+                        disabled=["Status","Caixa","Forma","Data/Hora","Valor Caixa","AutExtRef"],
+                        hide_index=True, use_container_width=True,
+                        key="ed_vinc_cx",
+                        height=min(400, 45 + len(df_ed_cx)*35),
+                    )
+                    linhas_sel_cx = edited_cx[edited_cx["✔"]].index.tolist()
+                    sel_idx_cx = df_lado_cx.iloc[linhas_sel_cx]["_idx"].tolist()
+                    if sel_idx_cx:
+                        total_sel_cx = df_lado_cx[df_lado_cx["_idx"].isin(sel_idx_cx)]["Valor Caixa"].apply(
+                            lambda v: float(v) if str(v) not in ("","nan") else 0).sum()
+                        st.metric("Selecionado Caixa", f"R$ {total_sel_cx:,.2f}",
+                                  help=f"{len(sel_idx_cx)} registro(s)")
+
+            # ── Lado Rede ───────────────────────
+            with col_dir:
+                st.markdown("**2. Selecione do lado Rede:**")
+                if df_lado_rede.empty:
+                    st.info("Nenhum pendente do lado Rede.")
+                    sel_idx_rede = []
+                else:
+                    df_ed_rede = df_lado_rede[["_idx","Status","C.V. Rede","Data Rede","Bandeira Rede","Valor Rede"]].copy()
+                    df_ed_rede["Valor Rede"] = df_ed_rede["Valor Rede"].apply(
+                        lambda v: f"R$ {float(v):,.2f}" if str(v) not in ("","nan") else "")
+                    df_ed_rede.insert(0, "✔", False)
+                    edited_rede = st.data_editor(
+                        df_ed_rede.drop(columns=["_idx"]),
+                        column_config={
+                            "✔": st.column_config.CheckboxColumn("✔", width="small"),
+                            "Status":       st.column_config.TextColumn("Status",    width="medium"),
+                            "C.V. Rede":    st.column_config.TextColumn("C.V.",      width="medium"),
+                            "Data Rede":    st.column_config.TextColumn("Data",      width="small"),
+                            "Bandeira Rede":st.column_config.TextColumn("Bandeira",  width="small"),
+                            "Valor Rede":   st.column_config.TextColumn("Valor",     width="medium"),
+                        },
+                        disabled=["Status","C.V. Rede","Data Rede","Bandeira Rede","Valor Rede"],
+                        hide_index=True, use_container_width=True,
+                        key="ed_vinc_rede",
+                        height=min(400, 45 + len(df_ed_rede)*35),
+                    )
+                    linhas_sel_rede = edited_rede[edited_rede["✔"]].index.tolist()
+                    sel_idx_rede = df_lado_rede.iloc[linhas_sel_rede]["_idx"].tolist()
+                    if sel_idx_rede:
+                        total_sel_rede = df_lado_rede[df_lado_rede["_idx"].isin(sel_idx_rede)]["Valor Rede"].apply(
+                            lambda v: float(v) if str(v) not in ("","nan") else 0).sum()
+                        st.metric("Selecionado Rede", f"R$ {total_sel_rede:,.2f}",
+                                  help=f"{len(sel_idx_rede)} registro(s)")
+
+            # ── Comparação e confirmação ─────────
+            st.markdown("---")
+            obs_vinc = st.text_input("Observação (opcional):", key="obs_vinc_cx",
+                                     placeholder="Ex: parcelado, data de liquidação diferente...")
+
+            pode_vincular = len(sel_idx_cx) > 0 or len(sel_idx_rede) > 0
+            if not pode_vincular:
+                st.caption("Selecione ao menos um registro de cada lado para vincular.")
+            else:
+                # Mostra comparativo de valores
+                val_cx   = df_conc_caixa[df_conc_caixa["_idx"].isin(sel_idx_cx)]["Valor Caixa"].apply(
+                    lambda v: float(v) if str(v) not in ("","nan") else 0).sum()
+                val_rede = df_conc_caixa[df_conc_caixa["_idx"].isin(sel_idx_rede)]["Valor Rede"].apply(
+                    lambda v: float(v) if str(v) not in ("","nan") else 0).sum()
+                diff = abs(val_cx - val_rede)
+                diff_pct = (diff / val_cx * 100) if val_cx else 0
+
+                mc1, mc2, mc3 = st.columns(3)
+                mc1.metric("Total Caixa selecionado",  f"R$ {val_cx:,.2f}",
+                           delta=f"{len(sel_idx_cx)} registro(s)")
+                mc2.metric("Total Rede selecionado",   f"R$ {val_rede:,.2f}",
+                           delta=f"{len(sel_idx_rede)} registro(s)")
+                mc3.metric("Diferença",                f"R$ {diff:,.2f}",
+                           delta=f"{diff_pct:.1f}%",
+                           delta_color="off" if diff < 0.02 else "inverse")
+
+                btn_label = "🔗 Confirmar Vínculo Manual"
+                if st.button(btn_label, type="primary", key="btn_vinc_cx"):
+                    st.session_state["vinculos_caixa"].append({
+                        "idx_caixa": sel_idx_cx,
+                        "idx_rede":  sel_idx_rede,
+                        "obs":       obs_vinc,
+                        "val_cx":    val_cx,
+                        "val_rede":  val_rede,
+                    })
+                    st.success(f"🔗 Vínculo criado! ({len(sel_idx_cx)} Caixa + {len(sel_idx_rede)} Rede)")
+                    st.rerun()
+
+            # ── Lista de vínculos criados ────────
+            if st.session_state["vinculos_caixa"]:
+                st.divider()
+                st.markdown(f"**Vínculos manuais criados: {len(st.session_state['vinculos_caixa'])}**")
+                for i, v in enumerate(st.session_state["vinculos_caixa"]):
+                    with st.expander(
+                        f"🔗 Vínculo #{i+1} — Caixa R$ {v['val_cx']:,.2f} × Rede R$ {v['val_rede']:,.2f}"
+                        + (f" | {v['obs']}" if v.get('obs') else ""), expanded=False
+                    ):
+                        vc1, vc2 = st.columns(2)
+                        vc1.write(f"**Índices Caixa:** {v['idx_caixa']}")
+                        vc2.write(f"**Índices Rede:** {v['idx_rede']}")
+                        if st.button("🗑️ Remover vínculo", key=f"rm_vinc_{i}"):
+                            st.session_state["vinculos_caixa"].pop(i)
+                            st.rerun()
 
         # ── Export Excel da aba Caixa ──────────
-        def exportar_caixa(df_caixa, df_conc):
+        def exportar_caixa(df_caixa, df_conc, vinculos):
             out = io.BytesIO()
+            df_conc_exp = df_conc.drop(columns=["_idx","forma_norm"], errors="ignore")
             with pd.ExcelWriter(out, engine="xlsxwriter") as writer:
                 df_caixa.drop(columns=["data_hora","forma_norm","bandeira_norm","data"], errors="ignore").to_excel(
                     writer, sheet_name="Caixa Completo", index=False)
-                df_conc.to_excel(writer, sheet_name="Conciliação Caixa", index=False)
-                wb   = writer.book
-                fmt_h   = wb.add_format({"bold":True,"bg_color":"#1F3864","font_color":"white","border":1})
-                fmt_ok  = wb.add_format({"bg_color":"#C6EFCE"})
-                fmt_w   = wb.add_format({"bg_color":"#FFEB9C"})
-                fmt_e   = wb.add_format({"bg_color":"#FFC7CE"})
+                df_conc_exp.to_excel(writer, sheet_name="Conciliação Caixa", index=False)
+                # Aba de vínculos manuais
+                if vinculos:
+                    rows_vinc = []
+                    for i, v in enumerate(vinculos):
+                        rows_vinc.append({
+                            "Vínculo #":    i + 1,
+                            "Índices Caixa": str(v["idx_caixa"]),
+                            "Índices Rede":  str(v["idx_rede"]),
+                            "Valor Caixa":   v["val_cx"],
+                            "Valor Rede":    v["val_rede"],
+                            "Diferença":     abs(v["val_cx"] - v["val_rede"]),
+                            "Observação":    v.get("obs", ""),
+                        })
+                    pd.DataFrame(rows_vinc).to_excel(
+                        writer, sheet_name="Vínculos Manuais Cx", index=False)
+                wb     = writer.book
+                fmt_h  = wb.add_format({"bold":True,"bg_color":"#1F3864","font_color":"white","border":1})
+                fmt_ok = wb.add_format({"bg_color":"#C6EFCE"})
+                fmt_w  = wb.add_format({"bg_color":"#FFEB9C"})
+                fmt_man= wb.add_format({"bg_color":"#BDD7EE"})
+                fmt_e  = wb.add_format({"bg_color":"#FFC7CE"})
                 ws = writer.sheets["Conciliação Caixa"]
-                for cn, col in enumerate(df_conc.columns):
+                for cn, col in enumerate(df_conc_exp.columns):
                     ws.write(0, cn, col, fmt_h); ws.set_column(cn, cn, 20)
-                for rn in range(1, len(df_conc)+1):
-                    s = str(df_conc.iloc[rn-1]["Status"])
-                    ws.set_row(rn, None, fmt_ok if "✅" in s else (fmt_w if "⚠️" in s else fmt_e))
+                for rn in range(1, len(df_conc_exp)+1):
+                    s = str(df_conc_exp.iloc[rn-1]["Status"])
+                    ws.set_row(rn, None,
+                               fmt_ok  if "✅" in s else
+                               fmt_man if "🔗" in s else
+                               fmt_w   if "⚠️" in s else fmt_e)
             return out.getvalue()
 
-        excel_cx = exportar_caixa(df_caixa, df_conc_caixa)
+        excel_cx = exportar_caixa(df_caixa, df_conc_caixa, st.session_state["vinculos_caixa"])
         st.download_button(
             "⬇️ Exportar Caixa (Excel)",
             data=excel_cx,
