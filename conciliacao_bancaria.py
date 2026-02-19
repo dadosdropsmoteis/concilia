@@ -557,7 +557,8 @@ with aba_manual:
         # ── 1. Seleção do grupo da Rede ─────────
         st.markdown("#### 1. Selecione o grupo não conciliado")
 
-        opcoes_grupo = []
+        # Monta dicionário label → idx_grupo para evitar problemas de índice
+        mapa_grupo = {}
         for _, row in grupos_elegiveis.iterrows():
             try:
                 val_liq = float(row["Valor Líq. Rede"]) if str(row["Valor Líq. Rede"]).strip() not in ("", "nan") else 0.0
@@ -569,13 +570,15 @@ with aba_manual:
                 qtd = 0
             label = (f"{row['Data Rede']}  |  {row['Bandeira Rede']} {row['Tipo Rede']}  |  "
                      f"R$ {val_liq:,.2f}  |  {qtd} transações")
-            opcoes_grupo.append((label, row["idx_grupo"]))
+            mapa_grupo[label] = int(row["idx_grupo"])
 
-        labels_grupo  = [o[0] for o in opcoes_grupo]
-        indices_grupo = [o[1] for o in opcoes_grupo]
-
+        labels_grupo  = list(mapa_grupo.keys())
         sel_label     = st.selectbox("Grupo:", labels_grupo, key="sel_grupo")
-        sel_idx_grupo = int(indices_grupo[labels_grupo.index(sel_label)])
+        sel_idx_grupo = mapa_grupo.get(sel_label)
+
+        if sel_idx_grupo is None:
+            st.warning("Selecione um grupo para continuar.")
+            st.stop()
 
         # Exibe transações do grupo
         grupo_row         = df_rede_grupo[df_rede_grupo["idx_grupo"] == sel_idx_grupo].iloc[0]
@@ -605,14 +608,19 @@ with aba_manual:
         if df_ofx_pendentes.empty:
             st.warning("Não há lançamentos OFX REDE pendentes para vincular.")
         else:
-            opcoes_ofx = []
+            # Dicionário label → row para evitar problemas de índice
+            mapa_ofx = {}
             for _, row in df_ofx_pendentes.iterrows():
                 label = f"{row['data']}  |  {row['memo']}  |  R$ {row['valor_ofx']:,.2f}"
-                opcoes_ofx.append((label, row))
+                mapa_ofx[label] = row
 
-            labels_ofx    = [o[0] for o in opcoes_ofx]
+            labels_ofx    = list(mapa_ofx.keys())
             sel_ofx_label = st.selectbox("Lançamento OFX:", labels_ofx, key="sel_ofx")
-            sel_ofx_row   = opcoes_ofx[labels_ofx.index(sel_ofx_label)][1]
+            sel_ofx_row   = mapa_ofx.get(sel_ofx_label)
+
+            if sel_ofx_row is None:
+                st.warning("Selecione um lançamento OFX para continuar.")
+                st.stop()
 
             # ── 3. Conferência de valores ────────
             st.markdown("#### 3. Conferência de valores")
