@@ -194,6 +194,7 @@ def conciliar(df_ofx: pd.DataFrame, df_rede_grupo: pd.DataFrame,
         resultados.append({
             "Status":           status,
             "idx_grupo":        idx_grupo_matched,
+            "fitid_ofx":        row_ofx.get("fitid", ""),
             "Data OFX":         row_ofx["data"],
             "Valor OFX":        row_ofx["valor_ofx"],
             "Memo OFX":         row_ofx["memo"],
@@ -213,6 +214,7 @@ def conciliar(df_ofx: pd.DataFrame, df_rede_grupo: pd.DataFrame,
             resultados.append({
                 "Status":           "❌ Não Conciliado (Rede)",
                 "idx_grupo":        row_rede.get("idx_grupo"),
+                "fitid_ofx":        "",
                 "Data OFX":         "", "Valor OFX": "", "Memo OFX": "",
                 "Bandeira OFX":     "", "Tipo OFX": "",
                 "Data Rede":        row_rede.get("data", ""),
@@ -311,7 +313,7 @@ def exportar_excel(df_result: pd.DataFrame,
                    vinculos_manuais: dict) -> bytes:
     output = io.BytesIO()
 
-    df_result_exp = df_result.drop(columns=["idx_grupo"], errors="ignore")
+    df_result_exp = df_result.drop(columns=["idx_grupo", "fitid_ofx"], errors="ignore")
     df_grupo_exp  = df_rede_grupo.drop(columns=["idx_transacao", "idx_grupo"], errors="ignore")
     cols_det      = [c for c in df_detalhe_status.columns if c not in ("idx_transacao", "idx_grupo")]
     df_det_exp    = df_detalhe_status[cols_det]
@@ -437,20 +439,21 @@ if col_valor_rede == "Valor Bruto" and "valor_bruto" in df_rede_orig.columns:
 df_rede_grupo = agrupar_rede(df_rede_orig)
 df_result     = conciliar(df_ofx_rede, df_rede_grupo, tolerancia_dias, tolerancia_valor)
 
-# Lançamentos OFX REDE pendentes — usa fitid como chave única para evitar
-# falsos positivos por memo duplicado ou vazio
-fitids_conciliados_auto = set(
-    df_ofx_rede[df_ofx_rede["memo"].isin(
-        set(df_result[df_result["Status"].str.startswith(("✅", "⚠️"))]["Memo OFX"])
-    )]["fitid"]
+# Lançamentos OFX REDE pendentes:
+# Usa fitid direto do df_result (✅/⚠️) + vínculos manuais da sessão
+fitids_conciliados = set(
+    df_result[df_result["Status"].str.startswith(("✅", "⚠️"))]["fitid_ofx"].dropna()
 )
-fitids_vinculados_manual = set(
-    info.get("fitid_ofx", "") for info in st.session_state["vinculos_manuais"].values()
-    if info.get("fitid_ofx", "")
-)
-fitids_usados = fitids_conciliados_auto | fitids_vinculados_manual
+fitids_conciliados.discard("")
 
-df_ofx_pendentes = df_ofx_rede[~df_ofx_rede["fitid"].isin(fitids_usados)].copy()
+fitids_manuais = set(
+    info["fitid_ofx"] for info in st.session_state["vinculos_manuais"].values()
+    if info.get("fitid_ofx")
+)
+
+df_ofx_pendentes = df_ofx_rede[
+    ~df_ofx_rede["fitid"].isin(fitids_conciliados | fitids_manuais)
+].copy()
 
 # Grupos não conciliados automaticamente
 # Apenas grupos com idx_grupo válido (lado Rede não conciliado)
@@ -539,7 +542,7 @@ with aba_result:
             return f"R$ {float(v):,.2f}"
         except: return v
 
-    df_show = df_filtrado.drop(columns=["idx_grupo"], errors="ignore").copy()
+    df_show = df_filtrado.drop(columns=["idx_grupo", "fitid_ofx"], errors="ignore").copy()
     for c in ["Valor OFX", "Valor Bruto Rede", "Valor Líq. Rede", "Diferença (R$)"]:
         if c in df_show.columns:
             df_show[c] = df_show[c].apply(fmt_brl)
@@ -641,21 +644,24 @@ with aba_manual:
         st.markdown("#### 2. Selecione as transações da intermediadora")
         st.caption("Marque transações até atingir o valor do lançamento OFX acima.")
 
-        # Transações ainda não vinculadas a nenhum OFX (automático ou manual)
-        # Exclui transações que já foram conciliadas automaticamente
-        grupos_conciliados_auto = set(
-            df_result[df_result["Status"].str.startswith(("✅", "⚠️"))]["idx_grupo"].dropna().astype(int)
+        # Transações disponíveis = todas as da intermediadora que ainda não foram:
+        #   - conciliadas automaticamente (pertencem a grupo ✅ ou ⚠️)
+        #   - vinculadas manualmente nesta sessão
+        _grupos_auto_ok = set(
+            df_result[df_result["Status"].str.startswith(("✅", "⚠️"))]["idx_grupo"]
+            .dropna().astype(int)
         )
-        idxs_auto_conciliados = set()
-        for ig in grupos_conciliados_auto:
-            rows = df_rede_grupo[df_rede_grupo["idx_grupo"] == ig]
-            if not rows.empty:
-                for idx_t in rows.iloc[0]["idx_transacao"]:
-                    idxs_auto_conciliados.add(idx_t)
+        idxs_bloqueados = set()
+        for ig in _grupos_auto_ok:
+            row_g = df_rede_grupo[df_rede_grupo["idx_grupo"] == ig]
+            if not row_g.empty:
+                idxs_bloqueados.update(row_g.iloc[0]["idx_transacao"])
+        # Adiciona as vinculadas manualmente nesta sessão
+        for info in st.session_state["vinculos_manuais"].values():
+            idxs_bloqueados.update(info.get("idx_transacoes", []))
 
         df_trans_disponiveis = df_rede_orig[
-            ~df_rede_orig["idx_transacao"].isin(idxs_auto_conciliados) &
-            ~df_rede_orig["idx_transacao"].isin(transacoes_vinculadas)
+            ~df_rede_orig["idx_transacao"].isin(idxs_bloqueados)
         ].copy().reset_index(drop=True)
 
         if df_trans_disponiveis.empty:
