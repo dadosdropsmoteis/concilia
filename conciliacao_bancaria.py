@@ -196,7 +196,7 @@ def parse_intermediadora_xls(file) -> pd.DataFrame:
     df["taxa_pct"]      = df_raw["TAXA FINAL (%)"].apply(to_float)
     df["status_adq"]    = df_raw.get("STATUS VENDA", pd.Series([""] * len(df_raw))).astype(str)
     df["cv"]            = df_raw.get("C.V.", pd.Series([""] * len(df_raw))).astype(str)
-    df["estabelecimento"] = df_raw.get("ESTABELECIMENTO", pd.Series([""] * len(df_raw))).astype(str)
+    df["estabelecimento"] = df_raw.get("ESTABELECIMENTO", pd.Series([""] * len(df_raw))).astype(str).str.strip()
     df["captura"]         = df_raw.get("CAPTURA", pd.Series([""] * len(df_raw))).astype(str).str.strip().str.upper()
 
     df["bandeira"] = df["bandeira"].replace({
@@ -969,9 +969,19 @@ if file_estab:
         st.sidebar.error(f"Erro ao ler estabelecimentos: {e}")
 
 def lookup_estab(df_estab, key, col):
-    """Retorna Fantasia dado um valor na coluna col."""
+    """Retorna Fantasia dado um valor na coluna col.
+    Normaliza ambos os lados: remove espaços e converte float→int→str
+    para garantir match mesmo com '91440580.0' vs '91440580'.
+    """
     if df_estab.empty: return ""
-    row = df_estab[df_estab[col].astype(str).str.strip() == str(key).strip()]
+    def norm(v):
+        s = str(v).strip()
+        try:
+            return str(int(float(s)))
+        except:
+            return s
+    key_norm = norm(key)
+    row = df_estab[df_estab[col].apply(norm) == key_norm]
     return row.iloc[0]["Fantasia"] if not row.empty else ""
 
 # ─────────────────────────────────────────────
