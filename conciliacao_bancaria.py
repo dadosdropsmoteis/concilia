@@ -458,8 +458,18 @@ def parse_estabelecimentos(file) -> pd.DataFrame:
     """Lê Lista_Estabelecimentos.xlsx → DataFrame com Fantasia, CNPJ, ESTABELECIMENTO, ACCTID."""
     df = pd.read_excel(file)
     df.columns = [c.strip() for c in df.columns]
-    df["ACCTID"] = df["ACCTID"].astype(str).str.strip()
-    df["ESTABELECIMENTO"] = df["ESTABELECIMENTO"].astype(str).str.strip()
+
+    def int_str(v):
+        """Converte numérico (int ou float) para string sem '.0'.
+        Ex: 7197997393.0 → '7197997393'   NaN → ''"""
+        try:
+            if pd.isna(v): return ""
+            return str(int(float(str(v)))).strip()
+        except:
+            return str(v).strip()
+
+    df["ACCTID"]         = df["ACCTID"].apply(int_str)
+    df["ESTABELECIMENTO"] = df["ESTABELECIMENTO"].apply(int_str)
     return df
 
 
@@ -498,11 +508,23 @@ def parse_caixa(file) -> pd.DataFrame:
 
     # Normaliza tipo de pagamento
     def norm_forma(f):
-        f = str(f).strip()
-        if f in ("Crédito", "Crédito 3x"):      return "CREDITO"
-        if f in ("Cartão Debito",):              return "DEBITO"
-        if f == "PIX":                           return "PIX"
-        return f.upper()
+        """Normaliza Forma Pagamento para CREDITO / DEBITO / PIX / <MAIÚSCULO>.
+        Cobre variações entre unidades:
+          Crédito, Crédito 3x, Crédito 2x, Credito, CREDITO, Cartão Crédito, Cartao Credito → CREDITO
+          Débito, Debito, Cartão Debito, Cartao Débito, DEBITO                               → DEBITO
+          PIX, Pix                                                                            → PIX
+        """
+        fu = str(f).strip().upper()
+        # Remove acentos para comparação robusta
+        import unicodedata
+        fu_norm = ''.join(
+            c for c in unicodedata.normalize('NFD', fu)
+            if unicodedata.category(c) != 'Mn'
+        )
+        if "CREDITO" in fu_norm or "CRÉDITO" in fu:  return "CREDITO"
+        if "DEBITO"  in fu_norm or "DÉBITO"  in fu:  return "DEBITO"
+        if "PIX" in fu_norm:                          return "PIX"
+        return fu
 
     df["forma_norm"] = df["Forma Pagamento"].apply(norm_forma)
 
