@@ -741,20 +741,33 @@ def parse_pix_pos(file) -> tuple[pd.DataFrame, dict]:
     Metadata: {nome, agencia, conta, acctid, periodo}
     Colunas do df: identificador, pagador, cpf_cnpj, vencimento, pago_em, valor_emitido, valor_pago, tarifa
     """
-    import xlrd
-    content = file.read()
-    # Força releitura com xlrd
-    import io as _io
-    wb = xlrd.open_workbook(file_contents=content)
-    ws = wb.sheet_by_index(0)
+    raw = file.read()
+    # Detecta formato pelo magic bytes e usa engine adequada
+    if raw[:4] == b'\xd0\xcf\x11\xe0':          # OLE2 — .xls binário legado
+        import xlrd
+        wb_xl = xlrd.open_workbook(file_contents=raw)
+        ws_xl = wb_xl.sheet_by_index(0)
+        # Converte para lista de listas para processamento uniforme
+        all_rows_raw = [
+            [str(ws_xl.cell_value(i, j)).strip() for j in range(ws_xl.ncols)]
+            for i in range(ws_xl.nrows)
+        ]
+    else:                                            # ZIP — .xlsx
+        import openpyxl, io as _io
+        wb_xl = openpyxl.load_workbook(_io.BytesIO(raw), data_only=True)
+        ws_xl = wb_xl.active
+        all_rows_raw = [
+            [str(cell.value).strip() if cell.value is not None else ""
+             for cell in row]
+            for row in ws_xl.iter_rows()
+        ]
 
     meta = {}
     header_row = None
     rows = []
 
-    for i in range(ws.nrows):
-        row_vals = [str(ws.cell_value(i, j)).strip() for j in range(ws.ncols)]
-        row_vals = [v for v in row_vals if v not in ("", "nan", "None")]
+    for i, full_row in enumerate(all_rows_raw):
+        row_vals = [v for v in full_row if v not in ("", "nan", "None")]
         if not row_vals:
             continue
 
@@ -770,8 +783,6 @@ def parse_pix_pos(file) -> tuple[pd.DataFrame, dict]:
         elif row_vals[0].lower() == "identificador":
             header_row = i
         elif header_row is not None and i > header_row:
-            # Linha de dados — precisa de pelo menos 6 colunas
-            full_row = [str(ws.cell_value(i, j)).strip() for j in range(ws.ncols)]
             if len(full_row) >= 6 and full_row[0]:
                 rows.append(full_row)
 
