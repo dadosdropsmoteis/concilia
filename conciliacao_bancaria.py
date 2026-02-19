@@ -437,17 +437,20 @@ if col_valor_rede == "Valor Bruto" and "valor_bruto" in df_rede_orig.columns:
 df_rede_grupo = agrupar_rede(df_rede_orig)
 df_result     = conciliar(df_ofx_rede, df_rede_grupo, tolerancia_dias, tolerancia_valor)
 
-# Lançamentos OFX REDE pendentes (não conciliados automaticamente nem manualmente)
-memos_conciliados = set(
-    df_result[df_result["Status"].str.startswith(("✅", "⚠️"))]["Memo OFX"]
+# Lançamentos OFX REDE pendentes — usa fitid como chave única para evitar
+# falsos positivos por memo duplicado ou vazio
+fitids_conciliados_auto = set(
+    df_ofx_rede[df_ofx_rede["memo"].isin(
+        set(df_result[df_result["Status"].str.startswith(("✅", "⚠️"))]["Memo OFX"])
+    )]["fitid"]
 )
-# Adiciona memos já vinculados manualmente
-memos_vinculados_manual = set(
-    info.get("memo_ofx", "") for info in st.session_state["vinculos_manuais"].values()
+fitids_vinculados_manual = set(
+    info.get("fitid_ofx", "") for info in st.session_state["vinculos_manuais"].values()
+    if info.get("fitid_ofx", "")
 )
-memos_conciliados = memos_conciliados | memos_vinculados_manual
+fitids_usados = fitids_conciliados_auto | fitids_vinculados_manual
 
-df_ofx_pendentes = df_ofx_rede[~df_ofx_rede["memo"].isin(memos_conciliados)].copy()
+df_ofx_pendentes = df_ofx_rede[~df_ofx_rede["fitid"].isin(fitids_usados)].copy()
 
 # Grupos não conciliados automaticamente
 # Apenas grupos com idx_grupo válido (lado Rede não conciliado)
@@ -754,6 +757,7 @@ with aba_manual:
                 st.session_state["vinculos_manuais"][idx_virtual] = {
                     "status":         status_manual,
                     "memo_ofx":       sel_ofx_row["memo"],
+                    "fitid_ofx":      sel_ofx_row.get("fitid", ""),   # chave única do OFX
                     "valor_ofx":      sel_ofx_row["valor_ofx"],
                     "data_ofx":       sel_ofx_row["data"],
                     "observacao":     obs,
@@ -762,7 +766,7 @@ with aba_manual:
                     "total_liq":      total_liq_sel,
                     "total_bruto":    total_bruto_sel,
                     "total_taxa":     total_taxa_sel,
-                    "virtual":        True,   # não corresponde a idx_grupo real
+                    "virtual":        True,
                 }
                 st.success(f"✅ {len(selecionadas)} transação(ões) vinculada(s) ao OFX **{sel_ofx_row['memo']}**!")
                 st.rerun()
