@@ -1458,29 +1458,31 @@ with aba_caixa:
                     sel_idx_cx = []
                 else:
                     df_ed_cx = df_lado_cx[["_idx","Status","Caixa","Forma","Data/Hora","Valor Caixa","AutExtRef"]].copy()
+                    df_ed_cx = df_ed_cx.reset_index(drop=True)  # índice 0..N para alinhar com editor
                     df_ed_cx["Valor Caixa"] = df_ed_cx["Valor Caixa"].apply(
                         lambda v: f"R$ {float(v):,.2f}" if str(v) not in ("","nan") else "")
                     df_ed_cx.insert(0, "✔", False)
                     edited_cx = st.data_editor(
-                        df_ed_cx.drop(columns=["_idx"]),
+                        df_ed_cx,
                         column_config={
-                            "✔": st.column_config.CheckboxColumn("✔", width="small"),
-                            "Status":     st.column_config.TextColumn("Status",    width="medium"),
-                            "Caixa":      st.column_config.TextColumn("Caixa",     width="small"),
-                            "Forma":      st.column_config.TextColumn("Forma",     width="small"),
-                            "Data/Hora":  st.column_config.TextColumn("Data/Hora", width="medium"),
-                            "Valor Caixa":st.column_config.TextColumn("Valor",     width="medium"),
-                            "AutExtRef":  st.column_config.TextColumn("AutExtRef", width="medium"),
+                            "✔":          st.column_config.CheckboxColumn("✔",        width="small"),
+                            "_idx":       st.column_config.NumberColumn("_idx",       width="small"),
+                            "Status":     st.column_config.TextColumn("Status",       width="medium"),
+                            "Caixa":      st.column_config.TextColumn("Caixa",        width="small"),
+                            "Forma":      st.column_config.TextColumn("Forma",        width="small"),
+                            "Data/Hora":  st.column_config.TextColumn("Data/Hora",    width="medium"),
+                            "Valor Caixa":st.column_config.TextColumn("Valor",        width="medium"),
+                            "AutExtRef":  st.column_config.TextColumn("AutExtRef",    width="medium"),
                         },
-                        disabled=["Status","Caixa","Forma","Data/Hora","Valor Caixa","AutExtRef"],
+                        disabled=["_idx","Status","Caixa","Forma","Data/Hora","Valor Caixa","AutExtRef"],
                         hide_index=True, use_container_width=True,
                         key="ed_vinc_cx",
                         height=min(400, 45 + len(df_ed_cx)*35),
                     )
-                    linhas_sel_cx = edited_cx[edited_cx["✔"]].index.tolist()
-                    sel_idx_cx = df_lado_cx.iloc[linhas_sel_cx]["_idx"].tolist()
+                    # Lê _idx direto do editor — imune a dessincronias de índice
+                    sel_idx_cx = edited_cx[edited_cx["✔"]]["_idx"].astype(int).tolist()
                     if sel_idx_cx:
-                        total_sel_cx = df_lado_cx[df_lado_cx["_idx"].isin(sel_idx_cx)]["Valor Caixa"].apply(
+                        total_sel_cx = df_conc_caixa[df_conc_caixa["_idx"].isin(sel_idx_cx)]["Valor Caixa"].apply(
                             lambda v: float(v) if str(v) not in ("","nan") else 0).sum()
                         st.metric("Selecionado Caixa", f"R$ {total_sel_cx:,.2f}",
                                   help=f"{len(sel_idx_cx)} registro(s)")
@@ -1493,28 +1495,30 @@ with aba_caixa:
                     sel_idx_rede = []
                 else:
                     df_ed_rede = df_lado_rede[["_idx","Status","C.V. Rede","Data Rede","Bandeira Rede","Valor Rede"]].copy()
+                    df_ed_rede = df_ed_rede.reset_index(drop=True)  # índice 0..N para alinhar com editor
                     df_ed_rede["Valor Rede"] = df_ed_rede["Valor Rede"].apply(
                         lambda v: f"R$ {float(v):,.2f}" if str(v) not in ("","nan") else "")
                     df_ed_rede.insert(0, "✔", False)
                     edited_rede = st.data_editor(
-                        df_ed_rede.drop(columns=["_idx"]),
+                        df_ed_rede,
                         column_config={
-                            "✔": st.column_config.CheckboxColumn("✔", width="small"),
-                            "Status":       st.column_config.TextColumn("Status",    width="medium"),
-                            "C.V. Rede":    st.column_config.TextColumn("C.V.",      width="medium"),
-                            "Data Rede":    st.column_config.TextColumn("Data",      width="small"),
-                            "Bandeira Rede":st.column_config.TextColumn("Bandeira",  width="small"),
-                            "Valor Rede":   st.column_config.TextColumn("Valor",     width="medium"),
+                            "✔":            st.column_config.CheckboxColumn("✔",       width="small"),
+                            "_idx":         st.column_config.NumberColumn("_idx",      width="small"),
+                            "Status":       st.column_config.TextColumn("Status",      width="medium"),
+                            "C.V. Rede":    st.column_config.TextColumn("C.V.",        width="medium"),
+                            "Data Rede":    st.column_config.TextColumn("Data",        width="small"),
+                            "Bandeira Rede":st.column_config.TextColumn("Bandeira",    width="small"),
+                            "Valor Rede":   st.column_config.TextColumn("Valor",       width="medium"),
                         },
-                        disabled=["Status","C.V. Rede","Data Rede","Bandeira Rede","Valor Rede"],
+                        disabled=["_idx","Status","C.V. Rede","Data Rede","Bandeira Rede","Valor Rede"],
                         hide_index=True, use_container_width=True,
                         key="ed_vinc_rede",
                         height=min(400, 45 + len(df_ed_rede)*35),
                     )
-                    linhas_sel_rede = edited_rede[edited_rede["✔"]].index.tolist()
-                    sel_idx_rede = df_lado_rede.iloc[linhas_sel_rede]["_idx"].tolist()
+                    # Lê _idx direto do editor — imune a dessincronias de índice
+                    sel_idx_rede = edited_rede[edited_rede["✔"]]["_idx"].astype(int).tolist()
                     if sel_idx_rede:
-                        total_sel_rede = df_lado_rede[df_lado_rede["_idx"].isin(sel_idx_rede)]["Valor Rede"].apply(
+                        total_sel_rede = df_conc_caixa[df_conc_caixa["_idx"].isin(sel_idx_rede)]["Valor Rede"].apply(
                             lambda v: float(v) if str(v) not in ("","nan") else 0).sum()
                         st.metric("Selecionado Rede", f"R$ {total_sel_rede:,.2f}",
                                   help=f"{len(sel_idx_rede)} registro(s)")
