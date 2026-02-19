@@ -139,7 +139,7 @@ def agrupar_rede(df_rede: pd.DataFrame) -> pd.DataFrame:
     df_group = df_rede.groupby(group_cols, as_index=False).agg(agg)
     df_group["qtd_transacoes"] = df_group["idx_transacao"].apply(len)
     df_group = df_group.reset_index(drop=True)
-    df_group["idx_grupo"] = df_group.index
+    df_group["idx_grupo"] = df_group.index.astype(int)
     return df_group
 
 
@@ -245,9 +245,9 @@ def build_status_transacao(df_rede_orig: pd.DataFrame,
 
     # Sobrescreve com vínculos manuais
     for ig, info in vinculos_manuais.items():
-        status_grupo[ig] = info["status"]
-        memo_grupo[ig]   = info.get("memo_ofx", "")
-        valor_grupo[ig]  = info.get("valor_ofx", "")
+        status_grupo[int(ig)] = info["status"]
+        memo_grupo[int(ig)]   = info.get("memo_ofx", "")
+        valor_grupo[int(ig)]  = info.get("valor_ofx", "")
 
     # Mapa idx_transacao → idx_grupo
     mapa_idx = {}
@@ -456,7 +456,7 @@ with aba_result:
     # Aplica vínculos manuais na exibição
     df_result_display = df_result.copy()
     for ig, info in st.session_state["vinculos_manuais"].items():
-        mask = df_result_display["idx_grupo"] == ig
+        mask = df_result_display["idx_grupo"] == int(ig)
         df_result_display.loc[mask, "Status"]    = info["status"]
         df_result_display.loc[mask, "Memo OFX"]  = info.get("memo_ofx", "")
         df_result_display.loc[mask, "Valor OFX"] = info.get("valor_ofx", "")
@@ -546,7 +546,7 @@ with aba_manual:
     )
 
     grupos_elegiveis = grupos_nao_conc[
-        ~grupos_nao_conc["idx_grupo"].isin(grupos_vinculados_manual)
+        ~grupos_nao_conc["idx_grupo"].isin([int(k) for k in grupos_vinculados_manual])
     ].copy()
 
     if grupos_elegiveis.empty and not grupos_vinculados_manual:
@@ -575,7 +575,7 @@ with aba_manual:
         indices_grupo = [o[1] for o in opcoes_grupo]
 
         sel_label     = st.selectbox("Grupo:", labels_grupo, key="sel_grupo")
-        sel_idx_grupo = indices_grupo[labels_grupo.index(sel_label)]
+        sel_idx_grupo = int(indices_grupo[labels_grupo.index(sel_label)])
 
         # Exibe transações do grupo
         grupo_row         = df_rede_grupo[df_rede_grupo["idx_grupo"] == sel_idx_grupo].iloc[0]
@@ -646,7 +646,7 @@ with aba_manual:
 
             if confirmar:
                 status_manual = "🔗 Vinculado Manualmente" if abs(diff_val) < 0.01 else "🔗 Vinculado c/ Divergência"
-                st.session_state["vinculos_manuais"][sel_idx_grupo] = {
+                st.session_state["vinculos_manuais"][int(sel_idx_grupo)] = {
                     "status":     status_manual,
                     "memo_ofx":   sel_ofx_row["memo"],
                     "valor_ofx":  sel_ofx_row["valor_ofx"],
