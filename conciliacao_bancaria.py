@@ -21,6 +21,31 @@ st.set_page_config(
 st.title("🏦 Conciliação Bancária")
 st.caption("OFX (Extrato Banco) × XLS (Intermediadora / Rede)")
 
+# ── CSS: simplifica visual dos file_uploaders na sidebar ──
+st.markdown("""
+<style>
+/* Oculta "Drag and drop file here" e "Limit 200MB per file • XLS" */
+[data-testid="stFileUploaderDropzoneInstructions"] {
+    display: none !important;
+}
+/* Reduz dropzone — vira só o botão Browse */
+[data-testid="stFileUploaderDropzone"] {
+    padding: 0.35rem 0.5rem !important;
+    min-height: unset !important;
+}
+/* Botão Browse ocupa largura total */
+[data-testid="stFileUploaderDropzone"] button {
+    width: 100% !important;
+    font-size: 0.78rem !important;
+    padding: 0.2rem 0.5rem !important;
+}
+/* Menos espaço entre uploaders */
+[data-testid="stSidebar"] [data-testid="stFileUploader"] {
+    margin-bottom: 0.2rem !important;
+}
+</style>
+""", unsafe_allow_html=True)
+
 # Banner de estabelecimento — exibido após o carregamento
 _estab_placeholder = st.empty()
 
