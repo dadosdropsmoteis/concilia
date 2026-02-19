@@ -559,9 +559,16 @@ with aba_manual:
 
         opcoes_grupo = []
         for _, row in grupos_elegiveis.iterrows():
-            val_liq = float(row["Valor Líq. Rede"]) if row["Valor Líq. Rede"] != "" else 0.0
+            try:
+                val_liq = float(row["Valor Líq. Rede"]) if str(row["Valor Líq. Rede"]).strip() not in ("", "nan") else 0.0
+            except (ValueError, TypeError):
+                val_liq = 0.0
+            try:
+                qtd = int(float(str(row["Qtd Transações"]).strip())) if str(row["Qtd Transações"]).strip() not in ("", "nan") else 0
+            except (ValueError, TypeError):
+                qtd = 0
             label = (f"{row['Data Rede']}  |  {row['Bandeira Rede']} {row['Tipo Rede']}  |  "
-                     f"R$ {val_liq:,.2f}  |  {int(row['Qtd Transações'])} transações")
+                     f"R$ {val_liq:,.2f}  |  {qtd} transações")
             opcoes_grupo.append((label, row["idx_grupo"]))
 
         labels_grupo  = [o[0] for o in opcoes_grupo]
