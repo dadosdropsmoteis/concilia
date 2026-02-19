@@ -405,7 +405,12 @@ memos_conciliados = set(
 df_ofx_pendentes = df_ofx_rede[~df_ofx_rede["memo"].isin(memos_conciliados)].copy()
 
 # Grupos não conciliados automaticamente
-grupos_nao_conc = df_result[df_result["Status"].str.contains("❌")].copy()
+# Apenas grupos com idx_grupo válido (lado Rede não conciliado)
+grupos_nao_conc = df_result[
+    df_result["Status"].str.contains("❌") &
+    df_result["idx_grupo"].notna()
+].copy()
+grupos_nao_conc["idx_grupo"] = grupos_nao_conc["idx_grupo"].astype(int)
 grupos_vinculados_manual = set(st.session_state["vinculos_manuais"].keys())
 
 # ─────────────────────────────────────────────
@@ -570,7 +575,9 @@ with aba_manual:
                 qtd = 0
             label = (f"{row['Data Rede']}  |  {row['Bandeira Rede']} {row['Tipo Rede']}  |  "
                      f"R$ {val_liq:,.2f}  |  {qtd} transações")
-            mapa_grupo[label] = int(row["idx_grupo"])
+            ig = row["idx_grupo"]
+            if ig is None or (hasattr(ig, "__class__") and ig != ig): continue  # pula NaN
+            mapa_grupo[label] = int(ig)
 
         labels_grupo  = list(mapa_grupo.keys())
         sel_label     = st.selectbox("Grupo:", labels_grupo, key="sel_grupo")
