@@ -62,11 +62,14 @@ def parse_ofx(file_bytes: bytes) -> pd.DataFrame:
 
 
 def detectar_bandeira_tipo(memo: str):
-    """Extrai bandeira e tipo (CREDITO/DEBITO) do memo do OFX."""
+    """Extrai bandeira e tipo (CREDITO/DEBITO) do memo do OFX.
+    Sufixos reconhecidos:
+      CD / AT → CREDITO  (AT = antecipação de crédito)
+      DB      → DEBITO
+    """
     memo_upper = memo.upper()
     bandeiras = ["VISA", "MASTERCARD", "MASTER", "ELO", "AMEX",
                  "AMERICAN EXPRESS", "HIPERCARD", "HIPER", "CABAL", "DINERS"]
-    tipos = ["CREDITO", "CRÉDITO", "DEBITO", "DÉBITO", "CREDIT", "DEBIT"]
 
     bandeira, tipo = "OUTROS", "OUTROS"
     for b in bandeiras:
@@ -75,11 +78,52 @@ def detectar_bandeira_tipo(memo: str):
             bandeira = "AMEX"       if b == "AMERICAN EXPRESS" else bandeira
             bandeira = "HIPERCARD"  if b == "HIPER" else bandeira
             break
-    for t in tipos:
-        if t in memo_upper:
-            tipo = "CREDITO" if t in ["CREDITO", "CRÉDITO", "CREDIT"] else "DEBITO"
-            break
+
+    # Sufixos do memo OFX (ex: "REDE VISA DB0091440335", "REDE VISA AT0091440335")
+    if re.search(r"\bDB\b|\bDEBITO\b|\bDÉBITO\b|\bDEBIT\b", memo_upper):
+        tipo = "DEBITO"
+    elif re.search(r"\bCD\b|\bAT\b|\bCREDITO\b|\bCRÉDITO\b|\bCREDIT\b", memo_upper):
+        tipo = "CREDITO"
+
     return bandeira, tipo
+
+
+def proximo_dia_util(data):
+    """Retorna o próximo dia útil (seg-sex) a partir de data (inclusive se já for útil)."""
+    from datetime import timedelta
+    d = data
+    while d.weekday() >= 5:   # 5=sábado, 6=domingo
+        d += timedelta(days=1)
+    return d
+
+def adicionar_dias_uteis(data, n):
+    """Soma n dias úteis (seg-sex) a uma data."""
+    from datetime import timedelta
+    d = data
+    adicionados = 0
+    while adicionados < n:
+        d += timedelta(days=1)
+        if d.weekday() < 5:
+            adicionados += 1
+    return d
+
+def calcular_previsao(data, tipo_norm: str,
+                      prazo_debito: int, prazo_credito: int,
+                      credito_modo: str) -> str:
+    """Calcula data provável de recebimento no banco."""
+    from datetime import timedelta
+    try:
+        if tipo_norm == "DEBITO":
+            prev = adicionar_dias_uteis(data, prazo_debito)
+        else:  # CREDITO (inclui antecipação AT)
+            if credito_modo == "Dias úteis":
+                prev = adicionar_dias_uteis(data, prazo_credito)
+            else:
+                prev = data + timedelta(days=prazo_credito)
+                prev = proximo_dia_util(prev)
+        return prev.strftime("%d/%m/%Y")
+    except Exception:
+        return ""
 
 
 def parse_intermediadora_xls(file) -> pd.DataFrame:
@@ -377,6 +421,15 @@ with st.sidebar:
     tolerancia_dias  = st.slider("Tolerância de data (dias)", 0, 5, 1)
     tolerancia_valor = st.slider("Tolerância de valor (%)",   0, 10, 5) / 100
     col_valor_rede   = st.radio("Comparar OFX com:", ["Valor Líquido", "Valor Bruto"])
+
+    st.divider()
+    st.markdown("**📅 Prazo de recebimento estimado**")
+    prazo_debito  = st.number_input("Débito — dias úteis após venda", min_value=1, max_value=5,  value=1)
+    prazo_credito_modo = st.radio("Crédito — prazo em:", ["Dias úteis", "Dias corridos"], index=1)
+    prazo_credito = st.number_input(
+        f"Crédito — qtd de {'dias úteis' if prazo_credito_modo == 'Dias úteis' else 'dias corridos'}",
+        min_value=1, max_value=60, value=30
+    )
 
     st.divider()
     st.markdown("**Legenda:**")
@@ -730,6 +783,15 @@ with aba_manual:
             cols_tabela = [c for c in cols_tabela if c in df_trans_disponiveis.columns]
 
             df_editor = df_trans_disponiveis[cols_tabela].copy()
+
+            # Coluna de previsão de recebimento
+            df_editor["Prev. Recebimento"] = df_editor.apply(
+                lambda r: calcular_previsao(
+                    r["data"], r["tipo_norm"],
+                    prazo_debito, prazo_credito, prazo_credito_modo
+                ), axis=1
+            )
+
             df_editor["data"] = df_editor["data"].apply(
                 lambda d: d.strftime("%d/%m/%Y") if pd.notna(d) and hasattr(d, "strftime") else str(d)
             )
@@ -743,23 +805,25 @@ with aba_manual:
                     df_editor = df_editor.drop(columns=[c])
 
             df_editor = df_editor.rename(columns={
-                "data": "Data", "bandeira": "Bandeira",
+                "data": "Data Venda", "bandeira": "Bandeira",
                 "tipo_norm": "Tipo", "cv": "C.V.",
             })
 
             edited = st.data_editor(
                 df_editor,
                 column_config={
-                    "✔": st.column_config.CheckboxColumn("✔", help="Marque para incluir", width="small"),
-                    "Data":          st.column_config.TextColumn("Data",       width="small"),
-                    "Bandeira":      st.column_config.TextColumn("Bandeira",   width="small"),
-                    "Tipo":          st.column_config.TextColumn("Tipo",       width="small"),
-                    "C.V.":          st.column_config.TextColumn("C.V.",       width="medium"),
-                    "Valor Bruto":   st.column_config.TextColumn("Valor Bruto",  width="medium"),
-                    "Taxa (R$)":     st.column_config.TextColumn("Taxa (R$)",    width="small"),
-                    "Valor Líquido": st.column_config.TextColumn("Valor Líquido", width="medium"),
+                    "✔":                  st.column_config.CheckboxColumn("✔", help="Marque para incluir", width="small"),
+                    "Data Venda":         st.column_config.TextColumn("Data Venda",    width="small"),
+                    "Prev. Recebimento":  st.column_config.TextColumn("Prev. Recebimento", width="small",
+                                          help="Estimativa de quando o valor cai no banco"),
+                    "Bandeira":           st.column_config.TextColumn("Bandeira",      width="small"),
+                    "Tipo":               st.column_config.TextColumn("Tipo",          width="small"),
+                    "C.V.":               st.column_config.TextColumn("C.V.",          width="medium"),
+                    "Valor Bruto":        st.column_config.TextColumn("Valor Bruto",   width="medium"),
+                    "Taxa (R$)":          st.column_config.TextColumn("Taxa (R$)",     width="small"),
+                    "Valor Líquido":      st.column_config.TextColumn("Valor Líquido", width="medium"),
                 },
-                disabled=["Data", "Bandeira", "Tipo", "C.V.",
+                disabled=["Data Venda", "Prev. Recebimento", "Bandeira", "Tipo", "C.V.",
                           "Valor Bruto", "Taxa (R$)", "Valor Líquido"],
                 hide_index=True,
                 use_container_width=True,
