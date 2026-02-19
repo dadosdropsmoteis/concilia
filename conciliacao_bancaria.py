@@ -640,13 +640,13 @@ with aba_manual:
 
         val_ofx_s = float(sel_ofx_row["valor_ofx"])
 
-        # ── 2. Seleção das transações da intermediadora ──
-        st.markdown("#### 2. Selecione as transações da intermediadora")
-        st.caption("Marque transações até atingir o valor do lançamento OFX acima.")
+        # ── Detecta bandeira e tipo sugeridos pelo memo do OFX ──
+        bandeira_ofx, tipo_ofx = detectar_bandeira_tipo(sel_ofx_row["memo"])
 
-        # Transações disponíveis = todas as da intermediadora que ainda não foram:
-        #   - conciliadas automaticamente (pertencem a grupo ✅ ou ⚠️)
-        #   - vinculadas manualmente nesta sessão
+        # ── 2. Selecione as transações da intermediadora ──
+        st.markdown("#### 2. Selecione as transações da intermediadora")
+
+        # Transações disponíveis = não conciliadas auto nem vinculadas manual
         _grupos_auto_ok = set(
             df_result[df_result["Status"].str.startswith(("✅", "⚠️"))]["idx_grupo"]
             .dropna().astype(int)
@@ -656,16 +656,73 @@ with aba_manual:
             row_g = df_rede_grupo[df_rede_grupo["idx_grupo"] == ig]
             if not row_g.empty:
                 idxs_bloqueados.update(row_g.iloc[0]["idx_transacao"])
-        # Adiciona as vinculadas manualmente nesta sessão
         for info in st.session_state["vinculos_manuais"].values():
             idxs_bloqueados.update(info.get("idx_transacoes", []))
 
-        df_trans_disponiveis = df_rede_orig[
+        df_trans_all = df_rede_orig[
             ~df_rede_orig["idx_transacao"].isin(idxs_bloqueados)
         ].copy().reset_index(drop=True)
 
-        if df_trans_disponiveis.empty:
+        if df_trans_all.empty:
             st.warning("Não há transações disponíveis para vinculação.")
+            st.stop()
+
+        # ── Filtros ──────────────────────────────────────────
+        # Pré-seleciona bandeira/tipo detectados no memo do OFX
+        bandeiras_disp = sorted(df_trans_all["bandeira"].dropna().unique().tolist())
+        tipos_disp     = sorted(df_trans_all["tipo_norm"].dropna().unique().tolist())
+        datas_disp     = sorted(df_trans_all["data"].dropna().unique().tolist())
+
+        # Sugestão automática baseada no memo OFX
+        sugestao_bandeira = [b for b in bandeiras_disp if bandeira_ofx != "OUTROS" and b == bandeira_ofx]
+        sugestao_tipo     = [t for t in tipos_disp     if tipo_ofx     != "OUTROS" and t == tipo_ofx]
+
+        with st.expander("🔎 Filtros" + (f" — sugestão automática: **{bandeira_ofx} {tipo_ofx}**" if sugestao_bandeira else ""), expanded=True):
+            fc1, fc2, fc3 = st.columns(3)
+            with fc1:
+                fil_bandeira = st.multiselect(
+                    "Bandeira:", bandeiras_disp,
+                    default=sugestao_bandeira if sugestao_bandeira else bandeiras_disp,
+                    key="fil_bandeira"
+                )
+            with fc2:
+                fil_tipo = st.multiselect(
+                    "Tipo:", tipos_disp,
+                    default=sugestao_tipo if sugestao_tipo else tipos_disp,
+                    key="fil_tipo"
+                )
+            with fc3:
+                data_min = min(datas_disp)
+                data_max = max(datas_disp)
+                fil_datas = st.date_input(
+                    "Período:",
+                    value=(data_min, data_max),
+                    min_value=data_min,
+                    max_value=data_max,
+                    key="fil_datas",
+                    format="DD/MM/YYYY",
+                )
+
+        # Aplica filtros
+        df_trans_disponiveis = df_trans_all[
+            df_trans_all["bandeira"].isin(fil_bandeira) &
+            df_trans_all["tipo_norm"].isin(fil_tipo)
+        ].copy()
+
+        if isinstance(fil_datas, (list, tuple)) and len(fil_datas) == 2:
+            d_ini, d_fim = fil_datas
+            df_trans_disponiveis = df_trans_disponiveis[
+                (df_trans_disponiveis["data"] >= d_ini) &
+                (df_trans_disponiveis["data"] <= d_fim)
+            ]
+
+        df_trans_disponiveis = df_trans_disponiveis.reset_index(drop=True)
+
+        st.caption(f"**{len(df_trans_disponiveis)}** transação(ões) exibida(s) após filtros "
+                   f"(total disponível: {len(df_trans_all)})")
+
+        if df_trans_disponiveis.empty:
+            st.info("Nenhuma transação encontrada com os filtros aplicados.")
         else:
             # ── Tabela com checkbox (data_editor) ──
             cols_tabela = ["data", "bandeira", "tipo_norm", "cv",
@@ -673,8 +730,9 @@ with aba_manual:
             cols_tabela = [c for c in cols_tabela if c in df_trans_disponiveis.columns]
 
             df_editor = df_trans_disponiveis[cols_tabela].copy()
-            # Converte data para string para evitar exibição como timestamp no data_editor
-            df_editor["data"] = df_editor["data"].apply(lambda d: d.strftime("%d/%m/%Y") if pd.notna(d) and hasattr(d, "strftime") else str(d))
+            df_editor["data"] = df_editor["data"].apply(
+                lambda d: d.strftime("%d/%m/%Y") if pd.notna(d) and hasattr(d, "strftime") else str(d)
+            )
             df_editor.insert(0, "✔", False)   # coluna de seleção
 
             # Formata valores para exibição
