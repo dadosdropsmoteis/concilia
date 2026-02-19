@@ -474,9 +474,16 @@ def parse_estabelecimentos(file) -> pd.DataFrame:
 
 
 def acctid_do_ofx(file_bytes: bytes) -> str:
-    """Extrai o ACCTID do bloco <ACCTID> do OFX."""
+    """Extrai o ACCTID do bloco <ACCTID> do OFX.
+    Suporta formatos SGML (valor inline) e XML (<ACCTID>valor</ACCTID>).
+    """
     content = file_bytes.decode("latin-1", errors="ignore")
-    m = re.search(r"<ACCTID>(.*?)(?=<|\Z)", content, re.IGNORECASE)
+    # Tenta formato SGML: <ACCTID>7197997393  (valor até próxima tag, newline ou fim)
+    m = re.search(r"<ACCTID>\s*([^\s<]+)", content, re.IGNORECASE)
+    if m:
+        return m.group(1).strip()
+    # Tenta formato XML: <ACCTID>7197997393</ACCTID>
+    m = re.search(r"<ACCTID>(.*?)</ACCTID>", content, re.IGNORECASE | re.DOTALL)
     return m.group(1).strip() if m else ""
 
 
