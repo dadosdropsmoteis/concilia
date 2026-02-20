@@ -750,7 +750,7 @@ def parse_pix_pos(file) -> tuple[pd.DataFrame, dict]:
     """
     raw = file.read()
     # Detecta formato pelo magic bytes e usa engine adequada
-    if raw[:4] == b'\xd0\xcf\x11\xe0':          # OLE2 — .xls binário legado
+    if raw[:2] in (b"\xd0\xcf", b"\xD0\xCF") or raw[:4] == b"\xd0\xcf\x11\xe0":  # OLE2 — .xls binário legado
         import xlrd
         wb_xl = xlrd.open_workbook(file_contents=raw)
         ws_xl = wb_xl.sheet_by_index(0)
@@ -928,16 +928,23 @@ def parse_pix_tef(file) -> tuple:
                 tipo_iniciacao, instituicao, descricao, chave, id_conciliador
     Filtra somente CRÉDITO / RECEBIMENTO.
     """
-    import openpyxl, io as _io
+    import openpyxl, io as _io, csv as _csv
 
     raw = file.read()
-    wb  = openpyxl.load_workbook(_io.BytesIO(raw), data_only=True)
-    ws  = wb.active
 
-    all_rows = [
-        [str(c.value).strip() if c.value is not None else "" for c in row]
-        for row in ws.iter_rows()
-    ]
+    # Detecta formato: ZIP = xlsx, caso contrário tenta CSV (vindo do Google Sheets)
+    if raw[:4] == b"PK\x03\x04":
+        wb  = openpyxl.load_workbook(_io.BytesIO(raw), data_only=True)
+        ws  = wb.active
+        all_rows = [
+            [str(c.value).strip() if c.value is not None else "" for c in row]
+            for row in ws.iter_rows()
+        ]
+    else:
+        # CSV exportado do Google Sheets
+        text = raw.decode("utf-8", errors="replace")
+        reader = _csv.reader(text.splitlines())
+        all_rows = [[str(v).strip() for v in row] for row in reader]
 
     meta       = {}
     header_row = None
@@ -1098,6 +1105,50 @@ def conciliar_pix_unificado(df_pos: pd.DataFrame,
 
 
 # ─────────────────────────────────────────────
+# FUNÇÕES — GOOGLE SHEETS
+# ─────────────────────────────────────────────
+
+def gsheets_url_to_csv(url: str) -> str:
+    """
+    Converte qualquer URL do Google Sheets para URL de exportação CSV.
+    Aceita:
+      - URL de edição:    .../spreadsheets/d/ID/edit#gid=123
+      - URL de publicação:.../spreadsheets/d/ID/pub?gid=123
+      - URL de exportação já formatada
+    """
+    import re
+    url = url.strip()
+    # Extrai ID da planilha
+    m_id = re.search(r"/spreadsheets/d/([a-zA-Z0-9_-]+)", url)
+    if not m_id:
+        return url  # devolve como está — pode já ser CSV direto
+    sheet_id = m_id.group(1)
+    # Extrai gid da aba (opcional)
+    m_gid = re.search(r"[?&#]gid=(\d+)", url)
+    gid_param = f"&gid={m_gid.group(1)}" if m_gid else ""
+    return f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv{gid_param}"
+
+
+def ler_gsheets_como_bytes(url: str) -> "io.BytesIO | None":
+    """
+    Baixa uma planilha pública do Google Sheets como CSV e devolve
+    um objeto BytesIO que imita um arquivo enviado via st.file_uploader.
+    Retorna None em caso de erro, exibindo mensagem ao usuário.
+    """
+    import urllib.request, io as _io
+    csv_url = gsheets_url_to_csv(url)
+    try:
+        with urllib.request.urlopen(csv_url, timeout=15) as resp:
+            data = resp.read()
+        buf = _io.BytesIO(data)
+        buf.name = "gsheets_export.csv"   # parse_pix_* usa .name apenas para ACCTID
+        return buf
+    except Exception as e:
+        st.sidebar.error(f"Erro ao baixar Google Sheets: {e}")
+        return None
+
+
+# ─────────────────────────────────────────────
 # SIDEBAR
 # ─────────────────────────────────────────────
 with st.sidebar:
@@ -1106,8 +1157,29 @@ with st.sidebar:
     file_ofx   = st.file_uploader("Extrato Bancário (.ofx)",     type=["ofx", "OFX"])
     file_rede  = st.file_uploader("Extrato Intermediadora (.xls)", type=["xls", "xlsx", "tsv", "txt"])
     file_caixa   = st.file_uploader("🏪 Relatório de Caixa (.xlsx)", type=["xlsx"])
-    file_pix_pos = st.file_uploader("🔵 PIX POS (.xls)",  type=["xls","xlsx"])
-    file_pix_tef = st.file_uploader("🟣 PIX TEF (.xlsx)", type=["xls","xlsx"])
+    # ── PIX POS: arquivo ou Google Sheets ──
+    st.markdown("**🔵 PIX POS**")
+    _modo_pos = st.radio("Fonte POS:", ["📁 Arquivo", "🌐 Google Sheets"],
+                          horizontal=True, key="modo_pos", label_visibility="collapsed")
+    if _modo_pos == "📁 Arquivo":
+        file_pix_pos = st.file_uploader("PIX POS (.xls)", type=["xls","xlsx"],
+                                         label_visibility="collapsed")
+    else:
+        _url_pos = st.text_input("URL da planilha POS:", key="url_pos",
+                                  placeholder="https://docs.google.com/spreadsheets/d/...")
+        file_pix_pos = ler_gsheets_como_bytes(_url_pos) if _url_pos.strip() else None
+
+    # ── PIX TEF: arquivo ou Google Sheets ──
+    st.markdown("**🟣 PIX TEF**")
+    _modo_tef = st.radio("Fonte TEF:", ["📁 Arquivo", "🌐 Google Sheets"],
+                          horizontal=True, key="modo_tef", label_visibility="collapsed")
+    if _modo_tef == "📁 Arquivo":
+        file_pix_tef = st.file_uploader("PIX TEF (.xlsx)", type=["xls","xlsx"],
+                                         label_visibility="collapsed")
+    else:
+        _url_tef = st.text_input("URL da planilha TEF:", key="url_tef",
+                                  placeholder="https://docs.google.com/spreadsheets/d/...")
+        file_pix_tef = ler_gsheets_como_bytes(_url_tef) if _url_tef.strip() else None
 
     st.divider()
     st.header("⚙️ Parâmetros")
