@@ -18,7 +18,7 @@ st.set_page_config(
     layout="wide",
 )
 
-st.title("🏦 Conciliação Bancária")
+st.title("🏦 Caixas e Conciliação Bancária")
 st.caption("OFX (Extrato Banco) × XLS (Intermediadora / Rede)")
 
 # ── CSS: simplifica visual dos file_uploaders na sidebar ──
@@ -1172,19 +1172,26 @@ def lookup_estab(df_estab, key, col):
 # ─────────────────────────────────────────────
 # AGUARDA ARQUIVOS
 # ─────────────────────────────────────────────
-if not file_ofx or not file_rede:
-    st.info("👈 Importe o arquivo OFX e o extrato da intermediadora para iniciar.")
+# Arquivos obrigatórios: Lista Estabelecimentos + OFX + Intermediadora
+_faltando = []
+if not file_estab: _faltando.append("📋 Lista de Estabelecimentos")
+if not file_ofx:   _faltando.append("🏦 Extrato Bancário (OFX)")
+if not file_rede:  _faltando.append("📊 Extrato Intermediadora (XLS)")
+
+if _faltando:
+    st.info("👈 Para iniciar, importe os arquivos obrigatórios na barra lateral:")
+    for arq in _faltando:
+        st.markdown(f"- **{arq}**")
     with st.expander("ℹ️ Como usar"):
         st.markdown("""
-**Arquivo OFX** — Extrato bancário exportado pelo banco.  
-Lançamentos com "REDE" no memo são usados na conciliação. "SALDO TOTAL" é ignorado.
+**Arquivos obrigatórios:**
+- **Lista de Estabelecimentos (.xlsx)** — Mapeamento ACCTID × Estabelecimento
+- **Extrato Bancário (.ofx)** — Exportado pelo banco
+- **Extrato Intermediadora (.xls)** — Relatório da adquirente/rede
 
-**Arquivo XLS** — Relatório da intermediadora (TSV com extensão .xls).
-
-**Conciliação automática:** agrupa por Data + Bandeira + Tipo e cruza com o OFX.
-
-**Vinculação manual:** para grupos não conciliados automaticamente, associe a um  
-lançamento OFX pendente. Vínculos são exportados no Excel.
+**Arquivos opcionais (liberam módulos extras):**
+- **Relatório de Caixa (.xlsx)** — Libera a aba 🏪 Caixa
+- **PIX POS (.xls)** e/ou **PIX TEF (.xlsx)** — Libera a aba 🔵 PIX
         """)
     st.stop()
 
@@ -1330,14 +1337,27 @@ elif acctid_ofx:
 # ─────────────────────────────────────────────
 # ABAS PRINCIPAIS
 # ─────────────────────────────────────────────
-aba_result, aba_detalhe, aba_manual, aba_outros, aba_caixa, aba_pix_pos = st.tabs([
+# Monta lista de abas dinamicamente conforme arquivos disponíveis
+_nomes_abas = [
+    "🏪 Caixa",
     "🔍 Conciliação",
     "📋 Detalhe por Transação",
     "🔗 Vinculação Manual",
     "📄 Outros Lançamentos OFX",
-    "🏪 Caixa",
-    "🔵 PIX",
-])
+]
+_tem_pix = file_pix_pos or file_pix_tef
+if _tem_pix:
+    _nomes_abas.append("🔵 PIX")
+
+_abas = st.tabs(_nomes_abas)
+
+# Mapeia nomes para variáveis — Caixa só ativo se arquivo incluído
+aba_caixa   = _abas[0]
+aba_result  = _abas[1]
+aba_detalhe = _abas[2]
+aba_manual  = _abas[3]
+aba_outros  = _abas[4]
+aba_pix_pos = _abas[5] if _tem_pix else None
 
 # ════════════════════════════════════════════
 # ABA 1 — RESULTADO DA CONCILIAÇÃO
@@ -2159,9 +2179,9 @@ with aba_caixa:
 st.divider()
 
 # ════════════════════════════════════════════
-# ABA 6 — PIX (POS + TEF)
+# ABA 6 — PIX (POS + TEF)  — só renderiza se aba existe
 # ════════════════════════════════════════════
-with aba_pix_pos:
+with (aba_pix_pos if aba_pix_pos is not None else st.empty()):
     st.subheader("🔵 Conciliação PIX × OFX")
 
     tem_pos = bool(file_pix_pos)
