@@ -455,7 +455,7 @@ def exportar_excel(df_result: pd.DataFrame,
 # ─────────────────────────────────────────────
 
 def parse_estabelecimentos(file) -> pd.DataFrame:
-    """Lê Lista_Estabelecimentos.xlsx → DataFrame com Fantasia, CNPJ, ESTABELECIMENTO, ACCTID."""
+    """Lê Lista_Estabelecimentos.xlsx → DataFrame com Fantasia, Abreviação, CNPJ, ESTABELECIMENTO, ACCTID."""
     df = pd.read_excel(file)
     df.columns = [c.strip() for c in df.columns]
 
@@ -468,8 +468,12 @@ def parse_estabelecimentos(file) -> pd.DataFrame:
         except:
             return str(v).strip()
 
-    df["ACCTID"]         = df["ACCTID"].apply(int_str)
+    df["ACCTID"]          = df["ACCTID"].apply(int_str)
     df["ESTABELECIMENTO"] = df["ESTABELECIMENTO"].apply(int_str)
+    # Garante coluna Abreviação mesmo se não existir no arquivo
+    if "Abreviação" not in df.columns:
+        df["Abreviação"] = ""
+    df["Abreviação"] = df["Abreviação"].astype(str).str.strip()
     return df
 
 
@@ -919,20 +923,112 @@ def conciliar_pix_pos_ofx(df_pix: pd.DataFrame,
 # FUNÇÕES — PIX TEF
 # ─────────────────────────────────────────────
 
-def parse_pix_tef(file) -> tuple:
+def parse_pix_tef(file, df_estab: pd.DataFrame = None) -> tuple:
     """
-    Lê relatório PIX TEF Sicredi (.xlsx).
+    Lê relatório PIX TEF em dois formatos:
+
+    XLSX (Sicredi padrão):
+      Cabeçalho com Associado/Cooperativa/Conta, dados a partir da linha "Natureza da transação".
+
+    CSV (Google Sheets consolidado — múltiplas filiais):
+      Colunas fixas: Data Completa, Abrev, Caixa, <filiais...>, Natureza, Tipo, Nome, Data, Hora, Valor, ID...
+      Identificação de filial via coluna "Abrev" cruzada com df_estab["Abreviação"].
+
     Retorna (df_transacoes, metadata).
-    Metadata: {associado, periodo_inicio, periodo_fim, total_recebimentos}
-    Colunas df: natureza, tipo, nome, data_pago, hora, valor_num, end_to_end_id, origem,
-                tipo_iniciacao, instituicao, descricao, chave, id_conciliador
     Filtra somente CRÉDITO / RECEBIMENTO.
     """
     import openpyxl, io as _io, csv as _csv
 
     raw = file.read()
 
-    # Detecta formato: ZIP = xlsx, caso contrário tenta CSV (vindo do Google Sheets)
+    def br_float(s):
+        try:
+            return float(str(s).replace("R$","").replace(".","").replace(",",".").strip())
+        except:
+            return 0.0
+
+    def parse_data(s):
+        try:
+            return pd.to_datetime(str(s).strip()[:10], format="%d/%m/%Y").date()
+        except:
+            return None
+
+    # ── Formato CSV (Google Sheets) ──────────────────────────────────────
+    is_csv = raw[:4] != b"PK\x03\x04" and raw[:4] != b"\xd0\xcf\x11\xe0"
+    if is_csv:
+        text   = raw.decode("utf-8", errors="replace")
+        reader = _csv.reader(text.splitlines())
+        header = next(reader)
+        header = [h.strip() for h in header]
+
+        # Índices das colunas relevantes
+        idx_abrev    = header.index("Abrev")        if "Abrev"                 in header else None
+        idx_nat      = header.index("Natureza da transação") if "Natureza da transação" in header else None
+        idx_tipo     = header.index("Tipo da transação")     if "Tipo da transação"     in header else None
+        idx_nome     = header.index("Nome")          if "Nome"                  in header else None
+        idx_data     = header.index("Data")          if "Data"                  in header else None
+        idx_valor    = header.index("Valor")         if "Valor"                 in header else None
+        idx_id       = header.index("ID")            if "ID"                    in header else None
+        idx_inst     = header.index("Instituição")   if "Instituição"           in header else None
+        idx_chave    = header.index("Chave")         if "Chave"                 in header else None
+        idx_conc     = header.index("ID Conciliador")if "ID Conciliador"        in header else None
+
+        # Mapa abrev → Fantasia (via df_estab se disponível)
+        abrev_map = {}
+        if df_estab is not None and not df_estab.empty and "Abreviação" in df_estab.columns:
+            for _, er in df_estab.iterrows():
+                abrev_map[str(er["Abreviação"]).strip().upper()] = er["Fantasia"]
+
+        def get(row, idx):
+            return row[idx].strip() if idx is not None and idx < len(row) else ""
+
+        rows = []
+        for row in reader:
+            if not row or not row[0].strip():
+                continue
+            nat  = get(row, idx_nat).upper()
+            tipo = get(row, idx_tipo).upper()
+            if nat != "CRÉDITO" or tipo != "RECEBIMENTO":
+                continue
+            abrev = get(row, idx_abrev).upper()
+            if abrev in ("#N/A", ""):
+                continue
+            fantasia = abrev_map.get(abrev, abrev)
+            rows.append({
+                "natureza":       nat,
+                "tipo":           tipo,
+                "nome":           get(row, idx_nome),
+                "data_str":       get(row, idx_data),
+                "valor_str":      get(row, idx_valor),
+                "end_to_end_id":  get(row, idx_id),
+                "instituicao":    get(row, idx_inst),
+                "chave":          get(row, idx_chave),
+                "id_conciliador": get(row, idx_conc),
+                "abrev":          abrev,
+                "filial":         fantasia,
+            })
+
+        if not rows:
+            return pd.DataFrame(), {"formato": "csv_sheets", "total_filiais": 0}
+
+        df = pd.DataFrame(rows)
+        df["valor_num"] = df["valor_str"].apply(br_float)
+        df["data_pago"] = df["data_str"].apply(parse_data)
+        df = df.dropna(subset=["data_pago"]).reset_index(drop=True)
+        df["idx_tef"] = df.index
+
+        filiais = df["abrev"].unique().tolist()
+        meta = {
+            "formato":        "csv_sheets",
+            "total_filiais":  len(filiais),
+            "filiais":        ", ".join(sorted(filiais)),
+            "periodo_inicio": str(df["data_pago"].min()) if not df.empty else "",
+            "periodo_fim":    str(df["data_pago"].max()) if not df.empty else "",
+            "total_recebimentos": f"R$ {df['valor_num'].sum():,.2f}",
+        }
+        return df, meta
+
+    # ── Formato XLSX (Sicredi padrão por filial) ─────────────────────────
     if raw[:4] == b"PK\x03\x04":
         wb  = openpyxl.load_workbook(_io.BytesIO(raw), data_only=True)
         ws  = wb.active
@@ -941,10 +1037,10 @@ def parse_pix_tef(file) -> tuple:
             for row in ws.iter_rows()
         ]
     else:
-        # CSV exportado do Google Sheets
+        # CSV simples (outro formato)
         text = raw.decode("utf-8", errors="replace")
-        reader = _csv.reader(text.splitlines())
-        all_rows = [[str(v).strip() for v in row] for row in reader]
+        reader2 = _csv.reader(text.splitlines())
+        all_rows = [[str(v).strip() for v in row] for row in reader2]
 
     meta       = {}
     header_row = None
@@ -977,26 +1073,14 @@ def parse_pix_tef(file) -> tuple:
             "descricao","chave","id_conciliador"]
     df = pd.DataFrame(rows, columns=COLS[:len(rows[0])] + [f"_x{k}" for k in range(max(0, len(rows[0])-len(COLS)))])
 
-    # Somente créditos/recebimentos
     df = df[df["natureza"].str.upper() == "CRÉDITO"].copy()
     df = df[df["tipo"].str.upper() == "RECEBIMENTO"].copy()
-
-    def br_float(s):
-        try:
-            return float(str(s).replace("R$","").replace(".","").replace(",",".").strip())
-        except:
-            return 0.0
-
-    def parse_data(s):
-        try:
-            return pd.to_datetime(str(s).strip()[:10], format="%d/%m/%Y").date()
-        except:
-            return None
 
     df["valor_num"] = df["valor_str"].apply(br_float)
     df["data_pago"] = df["data_str"].apply(parse_data)
     df = df.dropna(subset=["data_pago"]).reset_index(drop=True)
     df["idx_tef"]   = df.index
+    meta["formato"] = "xlsx_sicredi"
     return df, meta
 
 
@@ -1051,6 +1135,7 @@ def conciliar_pix_unificado(df_pos: pd.DataFrame,
             resultado.append({
                 "Status":       status,
                 "Origem":       "POS",
+                "Filial":       "",
                 "Data Pago":    rp["data_pago"].strftime("%d/%m/%Y") if rp["data_pago"] else "",
                 "Identificador":rp.get("identificador",""),
                 "Pagador":      rp.get("pagador",""),
@@ -1074,6 +1159,7 @@ def conciliar_pix_unificado(df_pos: pd.DataFrame,
             resultado.append({
                 "Status":       status,
                 "Origem":       "TEF",
+                "Filial":       rt.get("filial", rt.get("abrev", "")),
                 "Data Pago":    rt["data_pago"].strftime("%d/%m/%Y") if rt["data_pago"] else "",
                 "Identificador":rt.get("end_to_end_id",""),
                 "Pagador":      rt.get("nome",""),
@@ -1089,6 +1175,7 @@ def conciliar_pix_unificado(df_pos: pd.DataFrame,
             resultado.append({
                 "Status":       "❌ Não encontrado no POS/TEF",
                 "Origem":       "OFX",
+                "Filial":       "",
                 "Data Pago":    "",
                 "Identificador":"",
                 "Pagador":      "",
@@ -2277,7 +2364,7 @@ with (aba_pix_pos if aba_pix_pos is not None else st.empty()):
         # ── Parse TEF ──
         if tem_tef:
             try:
-                df_pix_tef_data, meta_tef = parse_pix_tef(file_pix_tef)
+                df_pix_tef_data, meta_tef = parse_pix_tef(file_pix_tef, df_estab)
             except Exception as e:
                 st.error(f"Erro ao ler PIX TEF: {e}")
 
@@ -2291,8 +2378,18 @@ with (aba_pix_pos if aba_pix_pos is not None else st.empty()):
                         + (f"Período: {meta_pos.get('periodo','')}" if meta_pos.get('periodo') else ""))
         if tem_tef and meta_tef:
             with info_cols[1]:
-                st.info(f"**TEF** — {meta_tef.get('associado','—')}  |  "
-                        f"Período: {meta_tef.get('periodo_inicio','')} → {meta_tef.get('periodo_fim','')}")
+                if meta_tef.get("formato") == "csv_sheets":
+                    st.info(
+                        f"**TEF (Sheets)** — {meta_tef.get('total_filiais','?')} filiais  |  "
+                        f"Período: {meta_tef.get('periodo_inicio','')} → {meta_tef.get('periodo_fim','')}  |  "
+                        f"Total: {meta_tef.get('total_recebimentos','')}  |  "
+                        f"Filiais: {meta_tef.get('filiais','')}"
+                    )
+                else:
+                    st.info(
+                        f"**TEF** — {meta_tef.get('associado','—')}  |  "
+                        f"Período: {meta_tef.get('periodo_inicio','')} → {meta_tef.get('periodo_fim','')}"
+                    )
 
         # ── KPIs ──
         n_pos    = len(df_pix_pos_data)
@@ -2366,6 +2463,7 @@ with (aba_pix_pos if aba_pix_pos is not None else st.empty()):
         col_cfg_pix = {
             "Status":       st.column_config.TextColumn("Status",        width="medium"),
             "Origem":       st.column_config.TextColumn("Origem",        width="small"),
+            "Filial":       st.column_config.TextColumn("Filial",        width="small"),
             "Data Pago":    st.column_config.TextColumn("Data Pago",     width="small"),
             "Identificador":st.column_config.TextColumn("ID/EndToEnd",   width="large"),
             "Pagador":      st.column_config.TextColumn("Pagador",       width="medium"),
