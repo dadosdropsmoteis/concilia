@@ -745,25 +745,125 @@ def acctid_do_nome_arquivo_pix(filename: str) -> str:
     return ""
 
 
-def parse_pix_pos(file) -> tuple[pd.DataFrame, dict]:
+def parse_pix_pos(file, df_estab: pd.DataFrame = None) -> tuple:
     """
-    Lê relatório PIX POS do banco (formato .xls binário Sicredi).
+    Lê relatório PIX POS em dois formatos:
+
+    XLS/XLSX (Sicredi padrão por filial):
+      Cabeçalho com Nome/Agência/Conta, dados a partir da linha "identificador".
+
+    CSV (Google Sheets consolidado — múltiplas filiais):
+      Colunas: Data Completa, Filial, Caixa, <filiais...>, identificador,
+               pagador efetivo, cpf/cnpj, vencimento, pago em,
+               valor emitido (R$), valor pago (R$), tarifa (R$)
+      Identificação de filial via coluna "Filial" cruzada com df_estab["Abreviação"].
+
     Retorna (df_transacoes, metadata).
-    Metadata: {nome, agencia, conta, acctid, periodo}
-    Colunas do df: identificador, pagador, cpf_cnpj, vencimento, pago_em, valor_emitido, valor_pago, tarifa
     """
+    import csv as _csv
+
     raw = file.read()
-    # Detecta formato pelo magic bytes e usa engine adequada
-    if raw[:2] in (b"\xd0\xcf", b"\xD0\xCF") or raw[:4] == b"\xd0\xcf\x11\xe0":  # OLE2 — .xls binário legado
+
+    def br_float(s):
+        try:
+            return float(str(s).replace(".", "").replace(",", ".").strip())
+        except:
+            return 0.0
+
+    def parse_data(s):
+        s = str(s).strip()
+        try:
+            return pd.to_datetime(s[:10], format="%d/%m/%Y").date()
+        except:
+            return None
+
+    # ── Formato CSV (Google Sheets) ──────────────────────────────────────
+    is_csv = (raw[:2] not in (b"\xd0\xcf", b"\xD0\xCF")
+              and raw[:4] not in (b"\xd0\xcf\x11\xe0", b"PK\x03\x04"))
+    if is_csv:
+        text   = raw.decode("utf-8", errors="replace")
+        reader = _csv.reader(text.splitlines())
+        header = [h.strip() for h in next(reader)]
+
+        # Índices das colunas relevantes
+        def idx_of(*names):
+            for n in names:
+                if n in header: return header.index(n)
+            return None
+
+        idx_filial  = idx_of("Abrev", "Filial")  # "Abrev" é o padrão; "Filial" como fallback
+        idx_ident   = idx_of("identificador")
+        idx_pagador = idx_of("pagador efetivo")
+        idx_cpf     = idx_of("cpf/cnpj")
+        idx_venc    = idx_of("vencimento ou expiração")
+        idx_pago_em = idx_of("pago em")
+        idx_emitido = idx_of("valor emitido (R$)")
+        idx_pago    = idx_of("valor pago (R$)")
+        idx_tarifa  = idx_of("tarifa (R$)")
+
+        # Mapa abrev → Fantasia
+        abrev_map = {}
+        if df_estab is not None and not df_estab.empty and "Abreviação" in df_estab.columns:
+            for _, er in df_estab.iterrows():
+                abrev_map[str(er["Abreviação"]).strip().upper()] = er["Fantasia"]
+
+        def get(row, idx):
+            return row[idx].strip() if idx is not None and idx < len(row) else ""
+
+        rows = []
+        for row in reader:
+            if not row or not row[0].strip():
+                continue
+            ident = get(row, idx_ident)
+            if not ident or not ident.startswith("RESD"):
+                continue
+            abrev    = get(row, idx_filial).upper()
+            fantasia = abrev_map.get(abrev, abrev)
+            rows.append({
+                "identificador":  ident,
+                "pagador":        get(row, idx_pagador),
+                "cpf_cnpj":       get(row, idx_cpf),
+                "vencimento":     get(row, idx_venc),
+                "pago_em":        get(row, idx_pago_em),
+                "valor_emitido":  get(row, idx_emitido),
+                "valor_pago":     get(row, idx_pago),
+                "tarifa":         get(row, idx_tarifa),
+                "abrev":          abrev,
+                "filial":         fantasia,
+            })
+
+        if not rows:
+            return pd.DataFrame(), {"formato": "csv_sheets"}
+
+        df = pd.DataFrame(rows)
+        df["valor_pago_num"]    = df["valor_pago"].apply(br_float)
+        df["valor_emitido_num"] = df["valor_emitido"].apply(br_float)
+        df["tarifa_num"]        = df["tarifa"].apply(br_float)
+        df["data_pago"]         = df["pago_em"].apply(parse_data)
+        df = df.dropna(subset=["data_pago"]).reset_index(drop=True)
+        df["idx_pix"] = df.index
+
+        filiais = df["abrev"].unique().tolist()
+        meta = {
+            "formato":            "csv_sheets",
+            "total_filiais":      len(filiais),
+            "filiais":            ", ".join(sorted(filiais)),
+            "periodo_inicio":     str(df["data_pago"].min()),
+            "periodo_fim":        str(df["data_pago"].max()),
+            "total_recebimentos": f"R$ {df['valor_pago_num'].sum():,.2f}",
+        }
+        return df, meta
+
+    # ── Formato XLS/XLSX (Sicredi padrão por filial) ─────────────────────
+    if raw[:2] in (b"\xd0\xcf", b"\xD0\xCF") or raw[:4] == b"\xd0\xcf\x11\xe0":
         import xlrd
         wb_xl = xlrd.open_workbook(file_contents=raw)
         ws_xl = wb_xl.sheet_by_index(0)
-        # Converte para lista de listas para processamento uniforme
         all_rows_raw = [
             [str(ws_xl.cell_value(i, j)).strip() for j in range(ws_xl.ncols)]
             for i in range(ws_xl.nrows)
         ]
-    else:                                            # ZIP — .xlsx
+    else:
         import openpyxl, io as _io
         wb_xl = openpyxl.load_workbook(_io.BytesIO(raw), data_only=True)
         ws_xl = wb_xl.active
@@ -781,7 +881,6 @@ def parse_pix_pos(file) -> tuple[pd.DataFrame, dict]:
         row_vals = [v for v in full_row if v not in ("", "nan", "None")]
         if not row_vals:
             continue
-
         label = row_vals[0].lower()
         if "nome" in label and len(row_vals) > 1:
             meta["nome"] = row_vals[1]
@@ -797,10 +896,10 @@ def parse_pix_pos(file) -> tuple[pd.DataFrame, dict]:
             if len(full_row) >= 6 and full_row[0]:
                 rows.append(full_row)
 
-    # Monta ACCTID da metadata
     ag  = meta.get("agencia", "").strip()
     ct  = meta.get("conta", "").strip().replace("-","")
-    meta["acctid"] = ag + ct if ag and ct else ""
+    meta["acctid"]  = ag + ct if ag and ct else ""
+    meta["formato"] = "xls_sicredi"
 
     if not rows:
         return pd.DataFrame(), meta
@@ -809,28 +908,12 @@ def parse_pix_pos(file) -> tuple[pd.DataFrame, dict]:
         "identificador", "pagador", "cpf_cnpj",
         "vencimento", "pago_em", "valor_emitido", "valor_pago", "tarifa",
         *[f"_extra{k}" for k in range(max(0, len(rows[0]) - 8))]
-    ] if rows else [])
-
-    def br_float(s):
-        try:
-            return float(str(s).replace(".", "").replace(",", ".").strip())
-        except:
-            return 0.0
+    ])
 
     df["valor_pago_num"]    = df["valor_pago"].apply(br_float)
     df["valor_emitido_num"] = df["valor_emitido"].apply(br_float)
     df["tarifa_num"]        = df["tarifa"].apply(br_float)
-
-    def parse_data(s):
-        s = str(s).strip()
-        for fmt in ("%d/%m/%Y", "%d/%m/%Y, %H:%M:%S", "%d/%m/%Y %H:%M:%S"):
-            try:
-                return pd.to_datetime(s[:10], format="%d/%m/%Y").date()
-            except:
-                pass
-        return None
-
-    df["data_pago"] = df["pago_em"].apply(parse_data)
+    df["data_pago"]         = df["pago_em"].apply(parse_data)
     df = df.dropna(subset=["data_pago"]).reset_index(drop=True)
     df["idx_pix"] = df.index
     return df, meta
@@ -1135,7 +1218,7 @@ def conciliar_pix_unificado(df_pos: pd.DataFrame,
             resultado.append({
                 "Status":       status,
                 "Origem":       "POS",
-                "Filial":       "",
+                "Filial":       rp.get("filial", rp.get("abrev", "")),
                 "Data Pago":    rp["data_pago"].strftime("%d/%m/%Y") if rp["data_pago"] else "",
                 "Identificador":rp.get("identificador",""),
                 "Pagador":      rp.get("pagador",""),
@@ -2357,7 +2440,7 @@ with (aba_pix_pos if aba_pix_pos is not None else st.empty()):
         # ── Parse POS ──
         if tem_pos:
             try:
-                df_pix_pos_data, meta_pos = parse_pix_pos(file_pix_pos)
+                df_pix_pos_data, meta_pos = parse_pix_pos(file_pix_pos, df_estab)
             except Exception as e:
                 st.error(f"Erro ao ler PIX POS: {e}")
 
@@ -2371,11 +2454,19 @@ with (aba_pix_pos if aba_pix_pos is not None else st.empty()):
         # ── Metadata / info ──
         info_cols = st.columns(2)
         if tem_pos and meta_pos:
-            acctid_pix = meta_pos.get("acctid","") or acctid_do_nome_arquivo_pix(file_pix_pos.name)
+            acctid_pix = meta_pos.get("acctid","") or acctid_do_nome_arquivo_pix(getattr(file_pix_pos, "name", ""))
             with info_cols[0]:
-                st.info(f"**POS** — {meta_pos.get('nome','—')}  |  "
-                        f"Ag: {meta_pos.get('agencia','—')} Cc: {meta_pos.get('conta','—')}  |  "
-                        + (f"Período: {meta_pos.get('periodo','')}" if meta_pos.get('periodo') else ""))
+                if meta_pos.get("formato") == "csv_sheets":
+                    st.info(
+                        f"**POS (Sheets)** — {meta_pos.get('total_filiais','?')} filiais  |  "
+                        f"Período: {meta_pos.get('periodo_inicio','')} → {meta_pos.get('periodo_fim','')}  |  "
+                        f"Total: {meta_pos.get('total_recebimentos','')}  |  "
+                        f"Filiais: {meta_pos.get('filiais','')}"
+                    )
+                else:
+                    st.info(f"**POS** — {meta_pos.get('nome','—')}  |  "
+                            f"Ag: {meta_pos.get('agencia','—')} Cc: {meta_pos.get('conta','—')}  |  "
+                            + (f"Período: {meta_pos.get('periodo','')}" if meta_pos.get('periodo') else ""))
         if tem_tef and meta_tef:
             with info_cols[1]:
                 if meta_tef.get("formato") == "csv_sheets":
